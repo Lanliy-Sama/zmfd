@@ -5,7 +5,7 @@
 | Previous hotspot | Previous size | Current responsibility split |
 |---|---:|---|
 | `web/index.html` | about 6,300 lines | semantic HTML, one stylesheet, and four ordered behavior scripts |
-| `tests/test_protocol_adapters.py` | about 9,700 lines | discoverable aggregate, shared fixture, and five feature-oriented case groups |
+| `tests/test_protocol_adapters.py` | about 9,700 lines | discoverable aggregate, shared fixture, and six feature-oriented case groups |
 
 The browser assets remain plain HTML/CSS/JavaScript and require no bundler. The server exposes an explicit asset allowlist rather than mapping `/assets/` to a directory. The test aggregate checks duplicate method names so a future mixin cannot silently shadow an existing regression.
 

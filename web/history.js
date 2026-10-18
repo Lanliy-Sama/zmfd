@@ -921,6 +921,38 @@
       }
     }
 
+    async function clearAllHistory() {
+      if (!window.confirm("确定清空全部历史记录？\n\n所有本地请求镜像记录都会被删除（含进行中的记录），此操作不可恢复；上游会话不受影响。")) return;
+      const btn = $("btn-history-clear");
+      if (btn.disabled) return;
+      btn.disabled = true;
+      try {
+        const resp = await fetchWithTimeout("/api/history/clear", {
+          method: "POST",
+          headers: apiHeaders({ "Content-Type": "application/json" }),
+          body: "{}"
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data.ok) {
+          throw new Error(data.error?.message || `HTTP ${resp.status}`);
+        }
+        stopRecordPoll();
+        recordState.records = [];
+        recordState.currentId = "";
+        recordState.current = null;
+        recordState.page = 0;
+        recordState.exhausted = true;
+        showHistoryEmpty();
+        renderRecordList();
+        showHistoryMutationResult(data, "已清空全部历史记录");
+        loadRecordList(true);
+      } catch (err) {
+        window.showToast?.(`清空历史记录失败：${err.message || err}`, "error");
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
     function exportRecordMarkdown() {
       const r = recordState.current;
       if (!r) return;
@@ -929,6 +961,7 @@
     }
 
     $("btn-history-refresh").addEventListener("click", () => loadRecordList(true));
+    $("btn-history-clear").addEventListener("click", clearAllHistory);
     $("btn-history-more").addEventListener("click", () => loadRecordList(false));
     $("btn-record-delete").addEventListener("click", deleteRecord);
     $("btn-record-top").addEventListener("click", () => {

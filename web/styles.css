@@ -329,8 +329,10 @@
     .account-slot-track { height: 7px; margin-top: 6px; overflow: hidden; border-radius: 999px; background: rgba(148, 163, 184, 0.11); }
     .account-slot-fill { height: 100%; width: 0; border-radius: inherit; background: linear-gradient(90deg, var(--cyan-core), var(--violet-light)); transition: width 0.25s ease, background 0.2s; }
     .account-slot-fill.full { background: var(--amber-core); }
-    .account-profile-actions { display: flex; gap: 6px; margin-top: 12px; }
-    .account-profile-actions .tool-btn { flex: 1; justify-content: center; min-width: 0; padding: 5px 7px; font-size: 10.5px; }
+    .account-profile-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+    .account-profile-actions .tool-btn { flex: 1 1 72px; justify-content: center; min-width: 0; padding: 5px 7px; font-size: 10.5px; }
+    .account-profile-actions .tool-btn[data-profile-action="captcha"] { color: var(--amber-core); }
+    .account-profile-actions .tool-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .account-profile-actions .tool-btn[data-profile-action="remove"] { color: var(--rose-core); }
     .account-empty { grid-column: 1 / -1; padding: 24px 14px; border: 1px dashed var(--border-medium); border-radius: var(--radius-md); color: var(--text-muted); text-align: center; line-height: 1.8; }
     .account-empty span { color: var(--text-dim); font-size: 11px; }
@@ -646,6 +648,7 @@
       flex: none;
     }
     .history-side-title { font-size: 12.5px; font-weight: 700; color: var(--text-muted); }
+    .history-side-head .tool-btn { flex: none; white-space: nowrap; }
     .history-filters {
       display: flex; gap: 6px; align-items: center;
       padding: 8px 10px;

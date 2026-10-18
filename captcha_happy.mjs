@@ -1,23 +1,24 @@
 #!/usr/bin/env node
-// captcha_happy.mjs — in-process happy-dom Aliyun captcha solver for chat.z.ai.
+// captcha_happy.mjs — in-process happy-dom Aliyun captcha solver for zchat.z.ai.
 //
 // Ported from TriDefender/zcode-api src/proxy/captcha-happy.ts (proven Node
-// happy-dom solver). Target adapted from zcode.z.ai to chat.z.ai:
-//   - origin / referer: https://chat.z.ai/
-//   - default SceneId: didk33e0 (chat.z.ai), region sgp, prefix no8xfe
+// happy-dom solver). Target adapted from zcode.z.ai to zchat.z.ai:
+//   - origin / referer: https://zchat.z.ai/
+//   - default SceneId: xswyjefn (zchat.z.ai chat), region cn, prefix no8xfe
+//     (chat.z.ai uses didk33e0; pass --scene didk33e0 for that host)
 //
 // No browser, no canvas/playwright/Chromium. One solve ≈ 1-3s.
 //
 // Mechanics:
-//  1. cookie priming of https://chat.z.ai/ (5-min cache)
+//  1. cookie priming of https://zchat.z.ai/ (5-min cache)
 //  2. CDN disk cache at ~/.zai-captcha-cdn-cache/<sha1(url)> + in-mem cache
 //  3. installNativeToString (mask JS-implemented platform APIs as native)
 //  4. per-request client-hint / UA / origin / referer injection (interceptor)
 //  5. guest-side patches (Event.isTrusted, HTMLDocument naming)
-//  6. solve contract: initAliyunCaptcha + getInstance().startTracelessVerification()
+//  6. solve contract: initAliyunCaptcha + getInstance().show() (plus a bound-button click fallback)
 //
 // CLI:
-//   node captcha_happy.mjs [--scene didk33e0] [--region sgp] [--prefix no8xfe]
+//   node captcha_happy.mjs [--scene xswyjefn] [--region cn] [--prefix no8xfe]
 //                          [--timeout-ms 30000] [--attempts 3]
 // Prints exactly one JSON line to stdout on completion:
 //   {"ok":true,"captcha":"<base64 captcha_verify_param>","elapsed_ms":1234,"attempts":1}
@@ -32,7 +33,7 @@ import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 
-const ORIGIN = "https://chat.z.ai";
+const ORIGIN = "https://zchat.z.ai";
 const CDN_CACHE_DIR = path.join(os.homedir(), ".zai-captcha-cdn-cache");
 const _memCdnCache = new Map();
 let _cookieCache = { cookies: [], ts: 0 };
@@ -1302,8 +1303,8 @@ async function createDom(region, prefix) {
   const visitorId = crypto.randomUUID();
   const deviceMid = crypto.randomUUID();
   const pre = [
-    { name: "visitor_id", value: visitorId, domain: "chat.z.ai" },
-    { name: "device_mid", value: deviceMid, domain: "chat.z.ai" },
+    { name: "visitor_id", value: visitorId, domain: "zchat.z.ai" },
+    { name: "device_mid", value: deviceMid, domain: "zchat.z.ai" },
   ];
   for (const c of pre) {
     try {
@@ -1358,31 +1359,29 @@ function extractVerifyParam(param) {
     verifyParam = param.verifyParam || param.data || param.param;
   }
   if (!verifyParam || String(verifyParam).length < 20) {
-    throw new Error("solver returned empty param: " + JSON.stringify(param));
+    throw new Error("solver returned empty param (type=" + typeof param + ")");
   }
   const str = String(verifyParam);
-  // Strict validation: a REAL Aliyun verify param is ~280 chars of base64
-  // JSON containing certifyId + sceneId + isSign + a long securityToken.
-  // Short junk without securityToken comes from a degraded SDK result path
-  // and WILL be rejected upstream — never let it out of the solver.
-  if (str.length < 200) {
+  // The SDK emits a ~48-char degraded value when a PUZZLE challenge was not
+  // completed; that value is never accepted upstream. A real verify param is
+  // ~280 chars, so reject short results and let the UI offer manual solving.
+  if (str.length < 100) {
     throw new Error(
-      "verify param too short (" + str.length + " chars) — degraded result, refusing: " + str.slice(0, 80),
+      `verify param too short (${str.length} chars); puzzle challenge requires manual completion`,
     );
   }
+  // The live site forwards the SDK result as an opaque captcha_verify_param.
+  // Keep the historical base64-JSON check as a diagnostic, but do not reject
+  // a long non-empty result locally: the upstream is the authority and the
+  // proxy already retries F018/F019 with a forced fresh solve.
   try {
     const decoded = JSON.parse(Buffer.from(str, "base64").toString("utf8"));
     const secTok = decoded && (decoded.securityToken || decoded.SecurityToken);
     if (!secTok || String(secTok).length < 50) {
-      throw new Error(
-        "verify param missing securityToken — refusing degraded result: " + str.slice(0, 80),
-      );
+      console.error(`[verify-param] no securityToken; forwarding opaque value length=${str.length}`);
     }
-  } catch (err) {
-    if (err instanceof SyntaxError) {
-      throw new Error("verify param not base64-JSON: " + str.slice(0, 80));
-    }
-    throw err;
+  } catch (_err) {
+    console.error(`[verify-param] not base64 JSON; forwarding opaque value length=${str.length}`);
   }
   return str;
 }
@@ -1397,8 +1396,8 @@ function handleCaptchaResult(result) {
 }
 
 async function solveTraceless(opts) {
-  const scene = opts.scene || "didk33e0";
-  const region = opts.region || "sgp";
+  const scene = opts.scene || "xswyjefn";
+  const region = opts.region || "cn";
   const prefix = opts.prefix || "no8xfe";
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const stallMs = opts.stallMs ?? 6_000;
@@ -1438,17 +1437,25 @@ async function solveTraceless(opts) {
           mode: "popup",
           region,
           prefix,
-          language: "en",
+          language: "cn",
           element: "#cap",
           button: "#btn",
-          captchaLogoImg: "",
+          captchaLogoImg: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
           showErrorTip: false,
           getInstance: (inst) => {
             try {
               (inst.startTracelessVerification || inst.show).call(inst);
             } catch (e) {
               finish(reject)(new Error(`start: ${e.message}`));
+              return;
             }
+            // Some SDK builds only open the popup from the bound button.
+            setTimeout(() => {
+              try {
+                const trigger = w.document.querySelector("#btn");
+                if (trigger && typeof trigger.click === "function") trigger.click();
+              } catch (_) {}
+            }, 300);
           },
           success: (result) => {
             try {
@@ -1475,8 +1482,8 @@ async function solveTraceless(opts) {
 // ── CLI ──────────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
   const args = {
-    scene: process.env.CAPTCHA_SCENE || "didk33e0",
-    region: process.env.CAPTCHA_REGION || "sgp",
+    scene: process.env.CAPTCHA_SCENE || "xswyjefn",
+    region: process.env.CAPTCHA_REGION || "cn",
     prefix: process.env.CAPTCHA_PREFIX || "no8xfe",
     timeoutMs: 30_000,
     attempts: Number(process.env.CAPTCHA_ATTEMPTS || 3),

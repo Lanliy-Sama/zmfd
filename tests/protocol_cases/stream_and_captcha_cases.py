@@ -535,7 +535,7 @@ class StreamAndCaptchaCases:
         self.assertEqual("接下来我会查询天气。", json.loads(raw)["choices"][0]["message"]["content"])
         self.assertEqual(1, len(self.deleted_chats))
 
-    def test_stream_tool_retry_hides_failed_attempt_and_sends_keepalive(self) -> None:
+    def _run_stream_tool_retry_case(self, *, first_attempt_thinking: bool):
         current_stream = app.stream_zai_completion
         original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
         original_new_chat = app.new_chat
@@ -562,12 +562,17 @@ class StreamAndCaptchaCases:
             '<|DSML|parameter name="city">北京</|DSML|parameter>'
             '</|DSML|invoke></|DSML|tool_calls>'
         )
-        upstream_chunks = [
-            [
+        first_chunks = [
+            b'data: {"data":{"delta_content":"<tool_calls><invoke name=bad>","phase":"answer"}}\n\n',
+            b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+        ]
+        if first_attempt_thinking:
+            first_chunks.insert(
+                0,
                 b'data: {"data":{"delta_content":"FAILED_THINKING","phase":"thinking"}}\n\n',
-                b'data: {"data":{"delta_content":"<tool_calls><invoke name=bad>","phase":"answer"}}\n\n',
-                b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
-            ],
+            )
+        upstream_chunks = [
+            first_chunks,
             [
                 ("data: " + json.dumps({"data": {"delta_content": committed_thinking, "phase": "thinking"}}, ensure_ascii=False) + "\n\n").encode("utf-8"),
                 ("data: " + json.dumps({"data": {"delta_content": visible_call, "phase": "answer"}}, ensure_ascii=False) + "\n\n").encode("utf-8"),
@@ -611,15 +616,122 @@ class StreamAndCaptchaCases:
             app.new_chat = original_new_chat
             app.urlopen = original_urlopen
             app.SSE_KEEPALIVE_INTERVAL_SECONDS = original_interval
+        return status, raw, attempts, list(self.deleted_chats)
+
+    def test_stream_thinking_is_realtime_with_tools(self) -> None:
+        current_stream = app.stream_zai_completion
+        original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
+        original_new_chat = app.new_chat
+        original_urlopen = app.urlopen
+
+        class FakeResp:
+            def __init__(self, chunks):
+                self.chunks = chunks
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(self.chunks)
+
+        visible_call = (
+            '<|DSML|tool_calls><|DSML|invoke name="get_weather">'
+            '<|DSML|parameter name="city">北京</|DSML|parameter>'
+            "</|DSML|invoke></|DSML|tool_calls>"
+        )
+        chunks = [
+            b'data: {"data":{"delta_content":"THINK_ONE","phase":"thinking"}}\n\n',
+            b'data: {"data":{"delta_content":"-THINK_TWO","phase":"thinking"}}\n\n',
+            (
+                "data: "
+                + json.dumps(
+                    {"data": {"delta_content": visible_call, "phase": "answer"}},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            ).encode("utf-8"),
+            b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+        ]
+
+        def fake_new_chat(_state, _prompt, options=None):
+            return "00000000-0000-0000-0000-0000000000e1", "u1"
+
+        def fake_urlopen(_request, timeout=None):
+            return FakeResp(chunks)
+
+        app.stream_zai_completion = self.original_stream
+        app.new_chat = fake_new_chat
+        app.urlopen = fake_urlopen
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "天气"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+                        }
+                    ],
+                    "tool_choice": "auto",
+                    "include_thinking": True,
+                    "stream": True,
+                },
+            )
+        finally:
+            app.stream_zai_completion = current_stream
+            app.new_chat = original_new_chat
+            app.urlopen = original_urlopen
+            app.SSE_KEEPALIVE_INTERVAL_SECONDS = original_interval
+
+        self.assertEqual(200, status, raw[:500])
+        lines = [line for line in raw.splitlines() if line.startswith("data: ")]
+        reasoning_indexes = [i for i, line in enumerate(lines) if '"reasoning_content"' in line]
+        tool_index = next(i for i, line in enumerate(lines) if '"tool_calls"' in line)
+        self.assertEqual(2, len(reasoning_indexes), "两个 thinking delta 应各转发一次")
+        self.assertLess(reasoning_indexes[-1], tool_index, "thinking 必须先于工具调用到达")
+        self.assertIn("THINK_ONE", raw)
+        self.assertIn("-THINK_TWO", raw)
+        self.assertNotIn("<|DSML|", raw)
+
+    def test_stream_tool_retry_is_skipped_after_realtime_thinking(self) -> None:
+        status, raw, attempts, deleted = self._run_stream_tool_retry_case(
+            first_attempt_thinking=True
+        )
+        self.assertEqual(200, status, raw[:500])
+        self.assertEqual(1, attempts["count"], "thinking 已实时转发后不应重放首轮")
+        self.assertIn(": keep-alive", raw)
+        self.assertIn("FAILED_THINKING", raw)
+        self.assertNotIn("GOOD_THINKING", raw)
+        self.assertNotIn('"tool_calls"', raw)
+        self.assertNotIn("<|DSML|tool_calls>", raw)
+        self.assertIn('"error"', raw)
+        self.assertEqual(1, len(deleted), "失败首轮会话应清理")
+        records = app.local_history_records()
+        self.assertEqual(1, len(records), "一次客户端请求不应产生两条历史记录")
+        detail = app.get_local_history_record(str(records[0]["id"])) or {}
+        self.assertEqual("error", detail["status"])
+        self.assertEqual(0, detail.get("tool_retry_count", 0))
+        self.assertNotIn("Tool-call correction:", str(detail.get("final_prompt") or ""))
+
+    def test_stream_tool_retry_recovers_when_no_output_was_sent(self) -> None:
+        status, raw, attempts, deleted = self._run_stream_tool_retry_case(
+            first_attempt_thinking=False
+        )
         self.assertEqual(200, status, raw[:500])
         self.assertEqual(2, attempts["count"])
-        self.assertIn(": keep-alive", raw)
         self.assertNotIn("FAILED_THINKING", raw)
         self.assertIn("GOOD_THINKING", raw)
         self.assertIn('"tool_calls"', raw)
         self.assertIn("接下来我会查询天气", raw)
         self.assertNotIn("<|DSML|tool_calls>", raw)
-        self.assertEqual(2, len(self.deleted_chats), "失败首轮与成功重试会话都应清理")
+        self.assertEqual(2, len(deleted), "失败首轮与成功重试会话都应清理")
         records = app.local_history_records()
         self.assertEqual(1, len(records), "一次客户端请求的格式纠错不应产生两条历史记录")
         detail = app.get_local_history_record(str(records[0]["id"])) or {}
@@ -905,7 +1017,7 @@ class StreamAndCaptchaCases:
             "log": {
                 "entries": [
                     {
-                        "request": {"url": "https://chat.z.ai/api/v1/auths/signin"},
+                        "request": {"url": "https://zchat.z.ai/api/v1/auths/signin"},
                         "response": {
                             "status": 200,
                             "content": {
@@ -917,7 +1029,7 @@ class StreamAndCaptchaCases:
                     },
                     {
                         "request": {
-                            "url": "https://chat.z.ai/api/v2/chat/completions?user_id=worker-user",
+                            "url": "https://zchat.z.ai/api/v2/chat/completions?user_id=worker-user",
                             "headers": [{"name": "user-agent", "value": "worker-agent"}],
                             "postData": {"text": json.dumps({"model": "glm-5.2"})},
                         },

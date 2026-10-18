@@ -470,6 +470,7 @@
                 <span class="history-side-title">请求记录</span>
                 <span id="history-count" class="history-count">0</span>
                 <button id="btn-history-refresh" class="tool-btn" title="重新拉取列表"><span>刷新</span></button>
+                <button id="btn-history-clear" class="tool-btn history-danger" title="清空全部本地历史记录（不影响上游会话）"><span>清空全部</span></button>
               </div>
               <div class="history-filters">
                 <input id="history-search-input" class="input-custom" type="text" maxlength="256" placeholder="搜索标题 / 内容 / 模型…" />
@@ -597,7 +598,7 @@
                     <button id="btn-remove-profile" class="btn-secondary btn-danger" type="button">删除选中账号</button>
                     <button id="btn-compact-profiles" class="btn-secondary" type="button" disabled>清理同账号重复登录态</button>
                   </div>
-                  <div class="account-security-note account-captcha-note"><span class="account-security-mark">AUTO</span><span>验证码按服务端模式自动处理；此处不需要手动采集，浏览器或 HAR 仅用于获取登录态。</span></div>
+                  <div class="account-security-note account-captcha-note"><span class="account-security-mark">CAPTCHA</span><span>登录时的拼图验证码在官方浏览器窗口中手动完成；发送消息用的验证码默认自动处理；遇到拼图挑战时可在账号卡片点击「手动验证码」，完成后 90 秒内有效。</span></div>
                   <div class="account-security-note"><span class="account-security-mark">DPAPI</span><span>登录态仅保存在本机加密 profiles.local.json</span></div>
                   <div id="auth-status-banner" class="status-banner">读取登录态状态中...</div>
                 </div>
@@ -618,7 +619,7 @@
                       <label class="field-label" for="token-input">会话 token（三段式 JWT）
                         <span class="control-desc">浏览器登录或抓包获得，本地 DPAPI 加密保存</span>
                       </label>
-                      <input id="token-input" class="input-custom" type="password" placeholder="eyJ... 开头的 chat.z.ai 会话 token" autocomplete="off">
+                      <input id="token-input" class="input-custom" type="password" placeholder="eyJ... 开头的 zchat.z.ai 会话 token" autocomplete="off">
                     </div>
                     <button id="btn-token-login" class="btn-secondary btn-accent btn-full" type="button">使用 token 添加账号</button>
                   </div>
@@ -631,10 +632,10 @@
                   <div class="card-body">
                     <button id="btn-browser-login" class="btn-secondary btn-accent btn-full" type="button">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/><line x1="21.17" y1="8" x2="12" y2="8"/><line x1="3.95" y1="6.06" x2="8.54" y2="14"/><line x1="10.88" y1="21.94" x2="15.46" y2="14"/></svg>
-                      <span>拉起官方浏览器登录</span>
+                      <span>浏览器登录（手动过拼图）</span>
                     </button>
                     <div class="field-group">
-                      <label class="field-label" for="har-file-input">或上传 chat.z.ai.har 文件</label>
+                      <label class="field-label" for="har-file-input">或上传 zchat.z.ai.har 文件</label>
                       <input id="har-file-input" class="input-custom" type="file" accept=".har,application/json">
                     </div>
                     <button id="btn-upload-har" class="btn-secondary btn-full" type="button">上传 HAR 并提取登录态</button>

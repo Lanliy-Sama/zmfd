@@ -28,13 +28,13 @@ http://127.0.0.1:8008/
 
 支持无账号启动。没有 HAR 也能打开网页，在左侧导航进入「账号」页操作：
 
-1. 点击「拉起官方浏览器登录」。
-2. 在弹出的官方 `chat.z.ai` Chrome 窗口中手动登录并完成验证码。
-3. 登录成功后，本地服务会读取登录后的 token/user/device 摘要，保存 profile 并切换。
+1. 点击「浏览器登录（手动过拼图）」。
+2. 在弹出的官方 `zchat.z.ai` 浏览器窗口中手动登录并完成拼图验证码；窗口会最大化并置于最前，登录成功后自动抓取 token。
+3. 本地服务读取登录后的 token/user/device 摘要，保存 profile 并切换。
 
-登录后的消息验证码按服务端模式自动处理（fresh-captcha 默认优先本地求解器），账号页不再需要手动采集；浏览器只用于需要时的登录态获取。
+登录时的拼图验证码在弹出窗口中手动完成。一键启动默认**不预求**消息验证码：completion 先使用账号已保存的验证码或空值，正常请求通常不需要验证码；只有上游明确要求时，再到账号卡片点击「手动验证码」，在可见浏览器中完成拼图。手动验证码 90 秒内有效，供该账号的下一次请求直接使用。
 
-Playwright 现在是可选的浏览器登录/验证码回退组件：一键启动检测到 happy-dom 可用时不会为了它额外安装 Playwright。未安装时面板会禁用“浏览器登录”并提示改用 Token/HAR；如确实需要浏览器登录，可运行 `python -m pip install -r requirements.txt`。
+Playwright 用于浏览器手动过拼图登录；一键启动会在缺失时自动安装 `requirements.txt`，即使 happy-dom 已可用于消息验证码，也不会跳过浏览器登录组件。未安装且安装失败时面板会禁用“浏览器登录”并提示改用 Token/HAR；也可手动运行 `python -m pip install -r requirements.txt`。系统没有 Chrome/Edge 时，再运行 `python -m playwright install chromium` 安装 Playwright 自带浏览器。
 
 浏览器登录与旧版浏览器验证码流程在服务端共用独占流程锁：请求体完整校验后只有一个请求能进入浏览器工作器，其余请求返回 409 `auth_flow_busy` 并附带当前模式/阶段。进度读写使用独立锁，非持有者不会清空正在运行流程的状态。
 
@@ -50,10 +50,10 @@ Playwright 现在是可选的浏览器登录/验证码回退组件：一键启�
 2. 粘贴进“或粘贴会话 token”输入框（可填备注名）。
 3. 点击“使用 token 添加账号”，服务解析 payload 中的用户 id 并合成设备指纹，保存 profile 并切换。
 
-如果存在 `chat.z.ai.har`，一键脚本会自动预加载：
+如果存在 `zchat.z.ai.har`（旧文件名 `chat.z.ai.har` 仍会自动识别），一键脚本会自动预加载：
 
-- 优先使用 `glm2api\chat.z.ai.har`
-- 找不到时使用上一级目录的 `chat.z.ai.har`
+- 优先使用 `glm2api\zchat.z.ai.har`，找不到时回退到旧文件名 `glm2api\chat.z.ai.har`
+- 找不到时使用上一级目录的 `zchat.z.ai.har`，仍找不到时回退到旧文件名 `chat.z.ai.har`
 - 都找不到也会正常启动为无账号模式
 
 ## 源码布局
@@ -230,7 +230,8 @@ profiles.local.json
 
 ## 性能优化
 
-- **验证码预热池**：fresh-captcha 模式下验证码求解实测约 8 秒，且 captcha 实测一次性使用（复用会被上游 `F018 verify_failed` 拒绝，不能缓存复用）。改为在请求间隙由后台线程（`captcha-prefetch`）预解下一个验证码放入池中，请求到来直接取用——求解延迟对客户端归零；池空或预解失败时同步求解兜底（行为同旧版）。日志事件 `fresh_captcha_pool_hit`。
+- **验证码预热池（仅显式开启 `--fresh-captcha` 时）**：fresh-captcha 模式下验证码求解实测约 8 秒，且 captcha 实测一次性使用（复用会被上游 `F018 verify_failed` 拒绝，不能缓存复用）。改为在请求间隙由后台线程（`captcha-prefetch`）预解下一个验证码放入池中，请求到来直接取用——求解延迟对客户端归零；池空或预解失败时同步求解兜底（行为同旧版）。日志事件 `fresh_captcha_pool_hit`。
+  - **当前站点是 PUZZLE 拼图**：2026-10-18 实测 `zchat.z.ai` 的 chat/completions 返回 `CaptchaType: PUZZLE`；无头自动求解会收到 `F001/F008`，现在约 4 秒内以 `puzzle challenge requires manual completion` 快速结束。预热池只适用于可自动求解的 traceless 挑战；拼图请使用账号卡片的「手动验证码」。
 - **验证码远端时效（实测）**：池码 ~61 秒仍被上游接受，**~114 秒即被 `F019 verify_failed` 拒绝**（2026-08-29 03:57/04:02 日志对照；此前空闲 2 分钟后取池码导致 Claude Code 连续 500 并进入分钟级退避）。池 TTL 据此设为 75 秒：连续请求间隔通常 <30 秒，池码几乎总是热的；空闲超龄直接丢弃、现场重解。漏网时由"验证码被拒 → 免等待换会话强制重解"兜底，客户端无感。
 - **浏览器验证码并发隔离**：Playwright 回退 worker 为每个求解任务分配独立的单结果通道，反序完成时不会再由并发等待者取走并丢弃彼此的结果。排队上限为 8；满载立即回压，调用方超时/断连后任务会标记取消，worker 在启动昂贵浏览器操作和发布结果前跳过它。Playwright 启动失败会立即通知全部已排队等待者，空闲线程退出与新任务入队也通过同一锁消除竞态。`/api/status.captcha_worker` 和 `runtime.captcha_worker` 可查看线程、活跃、积压与累计回压。
 - **HEAD 探活**：支持 HEAD 方法（按 GET 语义应答、只省略响应体），并新增 `GET/HEAD /api/hello` 探测端点；此前 `HEAD /api/hello` 返回 501 Unsupported method 会让探测方误判服务不可用（日志 03:58 实测）。
@@ -310,6 +311,7 @@ python .\glm2api.py --serve --api-key "your-local-secret"
 - `GET/POST /api/settings/api-key`：读取或配置服务端 API Key（DPAPI 加密保存到 `apikey.local.json`；修改/清除已启用密钥需提交 `current_key`）。
 - `GET /api/auth/profiles`：列出已加载 profile、每个账号的实时并发占用和保存状态；单账号只返回本地 profile ID、标签、安全来源展示、用户名/不可逆指纹、重复状态和并发字段，不返回原始 HAR 来源路径、上游 chat ID、设备/验证码/HAR 指纹，也不再为每个账号重复附带模型列表。响应中的 `concurrency` 汇总账号池容量、占用、可接入槽位与调度顺序；账号池最多保留 64 个 profile，同 token 或 user_id 的重新导入会原位更新，不占新槽位。
 - `POST /api/auth/browser-login`：打开 Chrome 手动登录并采集 profile。
+- `POST /api/auth/captcha/manual`：打开可见浏览器，手动完成指定 profile 的消息拼图验证码；body 为 `{"profile_id":"...","timeout_sec":300}`。成功后写入该 profile 并返回 `manual_captcha_expires_in`（90 秒），该账号的下一次请求优先使用。
 - `POST /api/auth/har`：上传 HAR 并切换。
 - `POST /api/auth/token`：粘贴会话 token（三段式 JWT）添加账号并切换，body 为 `{"token":"...","label":"可选备注"}`。
 - `POST /api/auth/switch`：切换 profile。
@@ -337,15 +339,15 @@ python .\glm2api.py --serve --api-key "your-local-secret"
 ## 命令行快速发送
 
 ```powershell
-python .\glm2api.py --har ..\chat.z.ai.har --prompt "你好" --model glm-5.3 --fresh-captcha
-python .\glm2api.py --har ..\chat.z.ai.har --prompt "你好" --model glm-5.3-flash --fresh-captcha
-python .\glm2api.py --har ..\chat.z.ai.har --prompt "今天有什么新闻" --model glm-5.3 --web-search --fresh-captcha
-python .\glm2api.py --har ..\chat.z.ai.har --prompt "只输出 OK" --model glm-5.2 --no-thinking --fresh-captcha
+python .\glm2api.py --har ..\zchat.z.ai.har --prompt "你好" --model glm-5.3 --fresh-captcha
+python .\glm2api.py --har ..\zchat.z.ai.har --prompt "你好" --model glm-5.3-flash --fresh-captcha
+python .\glm2api.py --har ..\zchat.z.ai.har --prompt "今天有什么新闻" --model glm-5.3 --web-search --fresh-captcha
+python .\glm2api.py --har ..\zchat.z.ai.har --prompt "只输出 OK" --model glm-5.2 --no-thinking --fresh-captcha
 ```
 
-`--fresh-captcha` 表示“每次请求获取新验证码”，不再把是否启用 fresh-captcha 与浏览器实现绑定。旧参数 `--fresh-captcha-browser` 仍作为隐藏兼容别名。验证码求解器由 `--captcha-mode auto|happydom|browser` 控制：`happydom` 仅使用本地 Node 解码器，不启动浏览器；`browser` 使用常驻复用的 Playwright headless Chrome；`auto` 优先 happy-dom，失败时才回落浏览器。
+一键启动默认**不传** `--fresh-captcha`，而是按需使用账号已保存/手动验证码；只有显式传 `--fresh-captcha` 时才在每次 completion 前预求新码。`--fresh-captcha` 表示“每次请求获取新验证码”，不再把是否启用 fresh-captcha 与浏览器实现绑定。旧参数 `--fresh-captcha-browser` 仍作为隐藏兼容别名。验证码求解器由 `--captcha-mode auto|happydom|browser` 控制：`happydom` 仅使用本地 Node 解码器，不启动浏览器；`browser` 使用常驻复用的 Playwright headless Chrome；`auto` 优先 happy-dom，失败时才回落浏览器。当前 `zchat.z.ai` 的 PUZZLE 挑战无法无头自动完成，`browser` 路径会约 4 秒内返回 `puzzle challenge requires manual completion`；`--headed` 只用于观察窗口，拼图仍需人工拖动。
 
-一键启动会先验证 happy-dom（`captcha_happy.mjs`，同目录需有 `node` 与 `node_modules`）；可用时明确传入 `--captcha-mode happydom`，不会检查、安装或启动 Playwright。只有 happy-dom/Node 不可用时才准备 Playwright 并切换到 `browser` 回退模式。每次请求内建两次尝试（间隔 20 秒）；`--captcha-timeout-ms` 默认 75 秒。`/api/status` 会返回 `captcha_strategy`、`captcha_fresh_enabled`、`captcha_solver`、`captcha_happydom_available`、`captcha_browser_fallback_enabled` 和 `legacy_browser_captcha_refresh_enabled`，面板显示实际生效的求解链路；旧 `captcha_mode=browser_fresh` 值继续保留兼容。隐藏的旧版 `/api/auth/captcha-refresh` 仅在 `auto/browser + --fresh-captcha` 时可用；`happydom` 模式会直接返回 409，不会拉起 Playwright。
+一键启动会先验证 happy-dom（`captcha_happy.mjs`，同目录需有 `node` 与 `node_modules`）；可用时明确传入 `--captcha-mode happydom`。无论 happy-dom 是否可用，都会确保 Playwright 可用于浏览器登录和账号卡片的「手动验证码」。每次请求内建两次尝试（间隔 20 秒）；PUZZLE 错误会立即结束，不再空等；`--captcha-timeout-ms` 默认 75 秒。`/api/status` 会返回 `captcha_strategy`、`captcha_fresh_enabled`、`captcha_solver`、`captcha_happydom_available`、`captcha_browser_fallback_enabled` 和 `legacy_browser_captcha_refresh_enabled`，面板显示实际生效的求解链路；旧 `captcha_mode=browser_fresh` 值继续保留兼容。隐藏的旧版 `/api/auth/captcha-refresh` 仅在 `auto/browser + --fresh-captcha` 时可用；账号卡片的 `POST /api/auth/captcha/manual` 不受 captcha mode 限制，始终打开可见窗口等待手动拼图。
 
 启动器使用独立 `scripts/check_happydom.mjs` 探测 Node 依赖，并通过 `scripts/startup_helpers.ps1` 读取原生命令退出码。Windows PowerShell 5 不会再把依赖尚未安装时的 Node stderr 当作终止性 `NativeCommandError`；探测失败会继续进入 npm 自动安装或 Playwright 回退。
 
@@ -410,7 +412,7 @@ API 协议面**默认回传思维链**，不受面板"显示 Thinking"开关影�
 - 下一轮将工具执行结果作为 OpenAI `role: "tool"`、Responses `function_call_output` 或 Anthropic `tool_result` 传回，即可继续工具链；旧版 OpenAI `assistant.function_call → role:"function"` 也会保留，并将缺失的调用 ID 关联到最近同名函数调用。
 - OpenAI / Responses 里声明的 `web_search*` 内置工具会映射为当前上游的联网搜索开关；自定义函数仍由客户端负责执行。
 
-工具调用提示词使用精简的英文 DSML 契约：只保留一个按当前真实工具 schema 动态生成的正确示例，不再把多组错误标签写进提示词，避免模型模仿反例或在不同工具语法间漂移；无参数工具会生成空 invoke，未知工具的示例参数也从声明 schema 推导，不会凭空添加 `input` 字段。提示词保留 `required` / 指定工具的强制调用句与 Read 类工具的缓存守卫；内联上下文按工具 schema/规则在前、对话历史在后的语义顺序发送。额外的 completion guard 仍让模型自行判断是否需要工具，但明确禁止用“稍后读取/接下来调用”之类的进度计划冒充已完成回答，也明确说明真正完成时应正常无工具收尾。解析兼容 glm2api JSON 外壳、标准 XML、DeepSeek 分隔符/下划线/全角与 CJK 标签漂移、可安全补齐的外层结束标签，以及实测 Claude 风格 `<tool_call>…<arg_key>/<arg_value>…`（含后续 arg_key 漏开标签）、`Tool: … <tool_input>`、`**Calling:**` 和 `<function_call>`；同时修复嵌套 XML 参数、JSON 尾逗号/未引号键、HTML 实体和路径反斜杠。反引号/波浪线代码围栏（含未闭合围栏和内部反引号）里的示例不会被识别或剥离，未声明工具会被拒绝，声明为 `string` 的参数会在模型误输出对象 / 数组时转为紧凑 JSON 字符串。`tool_choice=auto` 完全以模型的可见最终通道为准：输出工具标记才转换为调用，没有工具标记就作为正常收尾返回，不猜测自然语言，也不把 thinking 中的候选调用提升执行。只有可见工具标记明显畸形时才附带纠错提示重采样一次；纠错会识别畸形输出原本指向的已声明工具并追加该工具的 schema 正例，但不会把 `auto` 擅自改成 `required`。`required` / forced 仍会强制调用，并可从 thinking 恢复遗漏的调用。首轮正文/reasoning 不会泄露给客户端；纠错耗尽会返回协议错误并把历史镜像标成 error。工具调用标记在上游流中会先缓冲和解析；协议请求验证后先发送响应头，请求级心跳随即覆盖历史附件准备、创建 chat、验证码、连接和响应读取的全阶段，每 10 秒向 OpenAI Chat、Responses、Anthropic 和网页聊天发送协议安全的 SSE keep-alive 注释。所有 SSE 帧经同一写锁串行输出；断连会在最近的阶段边界停止继续请求，并关闭尚未消费的上游响应，同时回收心跳及读取线程。普通无工具文本仍保持流式转发。
+工具调用提示词使用精简的英文 DSML 契约：只保留一个按当前真实工具 schema 动态生成的正确示例，不再把多组错误标签写进提示词，避免模型模仿反例或在不同工具语法间漂移；无参数工具会生成空 invoke，未知工具的示例参数也从声明 schema 推导，不会凭空添加 `input` 字段。提示词保留 `required` / 指定工具的强制调用句与 Read 类工具的缓存守卫；内联上下文按工具 schema/规则在前、对话历史在后的语义顺序发送。额外的 completion guard 仍让模型自行判断是否需要工具，但明确禁止用“稍后读取/接下来调用”之类的进度计划冒充已完成回答，也明确说明真正完成时应正常无工具收尾。解析兼容 glm2api JSON 外壳、标准 XML、DeepSeek 分隔符/下划线/全角与 CJK 标签漂移、可安全补齐的外层结束标签，以及实测 Claude 风格 `<tool_call>…<arg_key>/<arg_value>…`（含后续 arg_key 漏开标签）、`Tool: … <tool_input>`、`**Calling:**` 和 `<function_call>`；同时修复嵌套 XML 参数、JSON 尾逗号/未引号键、HTML 实体和路径反斜杠。反引号/波浪线代码围栏（含未闭合围栏和内部反引号）里的示例不会被识别或剥离，未声明工具会被拒绝，声明为 `string` 的参数会在模型误输出对象 / 数组时转为紧凑 JSON 字符串。`tool_choice=auto` 完全以模型的可见最终通道为准：输出工具标记才转换为调用，没有工具标记就作为正常收尾返回，不猜测自然语言，也不把 thinking 中的候选调用提升执行。只有可见工具标记明显畸形时才附带纠错提示重采样一次；纠错会识别畸形输出原本指向的已声明工具并追加该工具的 schema 正例，但不会把 `auto` 擅自改成 `required`。`required` / forced 仍会强制调用，并可从 thinking 恢复遗漏的调用。首轮已发送给客户端的正文/reasoning 不会被重放；纠错耗尽会返回协议错误并把历史镜像标成 error。OpenAI Chat/Responses 的正文采用实时工具流分离：`RealtimeToolCallStream` 立即转发所有不可能构成工具标记前缀的文本，完整工具块到达后立即交给同一套严格解析器；工具标记和代码围栏示例不会作为正文泄露。若首轮尚未转发任何正文或 thinking，畸形工具块仍会触发一次格式纠错；若首轮已转发正文或 thinking，则不再重放以避免重复，改为返回协议错误。Chat Completions 在工具块闭合时立即推送 `tool_calls` 增量；Responses 的正文同样实时转发，`function_call` 输出项在回合校验完成后立即推送，并与 completed 对象共用同一组稳定 ID；带工具的思考内容也实时转发，不再等回合结束。Anthropic thinking 继续按语义块完整后写入。协议请求验证后先发送响应头，请求级心跳随即覆盖历史附件准备、创建 chat、验证码、连接和响应读取的全阶段，每 10 秒向 OpenAI Chat、Responses、Anthropic 和网页聊天发送协议安全的 SSE keep-alive 注释。所有 SSE 帧经同一写锁串行输出；断连会在最近的阶段边界停止继续请求，并关闭尚未消费的上游响应，同时回收心跳及读取线程。无工具文本同样边生成边转发。
 
 ## 上下文文件封装
 

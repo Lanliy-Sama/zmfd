@@ -2,7 +2,7 @@
   "name": "zai-happydom-captcha",
   "version": "1.0.0",
   "private": true,
-  "description": "Node happy-dom Aliyun captcha solver for the chat.z.ai GLM proxy case (local-only dependency; do not commit node_modules)",
+  "description": "Node happy-dom Aliyun captcha solver for the zchat.z.ai GLM proxy case (local-only dependency; do not commit node_modules)",
   "scripts": {
     "test": "node --check captcha_happy.mjs && node tests/check_web.mjs",
     "release-check": "python scripts/public_release_check.py"

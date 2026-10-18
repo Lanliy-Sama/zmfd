@@ -23,6 +23,10 @@ history.local.json.d/
 .mypy_cache/
 .ruff_cache/
 
+# Local baseline snapshots and harness metadata.
+baseline/
+.zcode/
+
 # happy-dom captcha solver (local-only).
 node_modules/
 

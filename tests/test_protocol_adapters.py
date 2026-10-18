@@ -9,7 +9,9 @@ TESTS_ROOT = Path(__file__).resolve().parent
 if str(TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(TESTS_ROOT))
 
+from protocol_cases.captcha_config_cases import CaptchaConfigCases  # noqa: E402
 from protocol_cases.history_and_cleanup_cases import HistoryAndCleanupCases  # noqa: E402
+from protocol_cases.realtime_stream_cases import RealtimeStreamCases  # noqa: E402
 from protocol_cases.server_runtime_cases import ServerRuntimeCases  # noqa: E402
 from protocol_cases.stream_and_captcha_cases import StreamAndCaptchaCases  # noqa: E402
 from protocol_cases.support import ProtocolAdaptersTestSupport  # noqa: E402
@@ -20,6 +22,8 @@ from protocol_cases.web_and_compatibility_cases import WebAndCompatibilityCases 
 CASE_MIXINS = (
     ToolAndContextCases,
     StreamAndCaptchaCases,
+    CaptchaConfigCases,
+    RealtimeStreamCases,
     HistoryAndCleanupCases,
     ServerRuntimeCases,
     WebAndCompatibilityCases,
@@ -36,6 +40,8 @@ for _mixin in CASE_MIXINS:
 class ProtocolAdaptersTest(
     ToolAndContextCases,
     StreamAndCaptchaCases,
+    CaptchaConfigCases,
+    RealtimeStreamCases,
     HistoryAndCleanupCases,
     ServerRuntimeCases,
     WebAndCompatibilityCases,

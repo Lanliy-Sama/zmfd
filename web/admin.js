@@ -827,6 +827,13 @@
         const routingOrder = Math.max(1, Number(p.routing_order) || index + 1);
         const hasInflight = runtime.inflight > 0;
         const removeTitle = hasInflight ? `仍有 ${runtime.inflight} 个生成请求，暂不可删除` : "删除本地登录态";
+        const captchaBusy = Boolean(state.manualCaptchaBusy || state.browserLoginBusy);
+        const captchaDisabled = captchaBusy || !state.playwrightAvailable;
+        const captchaTitle = !state.playwrightAvailable
+          ? "浏览器组件未安装，无法打开手动验证码窗口"
+          : captchaBusy
+            ? "正在等待另一个浏览器流程完成"
+            : "打开浏览器手动完成该账号的消息验证码（90 秒内有效）";
         const badgeClass = full ? "busy" : (p.active ? "active" : "available");
         const badgeText = p.active ? (full ? "默认 · 已满" : "默认优先") : (full ? "已满" : "可接入");
         const card = document.createElement("article");
@@ -847,6 +854,7 @@
           </div>
           <div class="account-profile-actions">
             <button class="tool-btn" type="button" data-profile-action="select" data-profile-key="${escapeHtml(p.id)}" ${selected ? "disabled" : ""}>${selected ? "已选中" : "选中"}</button>
+            <button class="tool-btn" type="button" data-profile-action="captcha" data-profile-key="${escapeHtml(p.id)}" ${captchaDisabled ? "disabled" : ""} title="${escapeHtml(captchaTitle)}">手动验证码</button>
             <button class="tool-btn" type="button" data-profile-action="remove" data-profile-key="${escapeHtml(p.id)}" ${hasInflight ? "disabled" : ""} title="${escapeHtml(removeTitle)}">删除</button>
           </div>`;
         profilePoolList.appendChild(card);
@@ -874,6 +882,67 @@
       if (!id) return;
       profileSelect.value = id;
       renderAccountPool({ profiles: state.profiles, concurrency: state.concurrency, active_profile_id: state.activeProfileId });
+    }
+
+    async function requestManualCaptcha(profileId) {
+      const id = String(profileId || "");
+      if (!id || state.manualCaptchaBusy) return;
+      if (!state.playwrightAvailable) {
+        window.showToast("浏览器组件未安装，无法打开手动验证码窗口", "error");
+        return;
+      }
+      if (state.browserLoginBusy) {
+        window.showToast("浏览器登录正在进行，请稍后再试", "standby");
+        return;
+      }
+      const profile = state.profiles.find(p => p.id === id);
+      const profileName = profile?.label || "该账号";
+      state.manualCaptchaBusy = true;
+      renderAccountPool({ profiles: state.profiles, concurrency: state.concurrency, active_profile_id: state.activeProfileId });
+      authStatusBanner.className = "status-banner standby";
+      authStatusBanner.textContent = `正在打开 ${profileName} 的验证码窗口...`;
+      window.showToast(`已打开浏览器窗口，请完成拼图验证码（${profileName}）`);
+      const startedAt = Date.now();
+      let pollBusy = false;
+      let polling = true;
+      const pollTimer = setInterval(async () => {
+        if (!polling || pollBusy) return;
+        pollBusy = true;
+        try {
+          const res = await fetchWithTimeout("/api/auth/browser-login/status", { headers: apiHeaders() }, 5000);
+          const data = await res.json();
+          if (polling && data && data.stage) {
+            const elapsed = Math.round((Date.now() - startedAt) / 1000);
+            const extra = data.error ? ` (${data.error})` : "";
+            authStatusBanner.className = "status-banner standby";
+            authStatusBanner.textContent = `手动验证码: ${data.stage} · 已等待 ${elapsed}s${extra}`;
+          }
+        } catch (e) { /* status polling is best-effort */ }
+        finally { pollBusy = false; }
+      }, 1500);
+      try {
+        const res = await fetchWithTimeout("/api/auth/captcha/manual", {
+          method: "POST",
+          headers: apiHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ profile_id: id, timeout_sec: 300 })
+        }, BROWSER_LOGIN_FETCH_TIMEOUT_MS);
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
+        const expires = Number(data.manual_captcha_expires_in || 90);
+        authStatusBanner.className = "status-banner success";
+        authStatusBanner.textContent = `${profileName} 的手动验证码已保存，请在 ${expires} 秒内发送消息。`;
+        window.showToast(`手动验证码已保存：请在 ${expires} 秒内发送消息`, data.persisted === false ? "standby" : "success");
+        await reloadAllData();
+      } catch (err) {
+        authStatusBanner.className = "status-banner error";
+        authStatusBanner.textContent = `手动验证码失败: ${err.message}`;
+        window.showToast(`手动验证码失败: ${err.message}`, "error");
+      } finally {
+        polling = false;
+        clearInterval(pollTimer);
+        state.manualCaptchaBusy = false;
+        renderAccountPool({ profiles: state.profiles, concurrency: state.concurrency, active_profile_id: state.activeProfileId });
+      }
     }
 
     function activeProfileForStatus(data = {}) {
@@ -926,13 +995,15 @@
         const savedTime = store.saved_at ? ` · 保存于 ${store.saved_at}` : "";
         const dupText = duplicateCount > 0 ? ` · 发现 ${duplicateCount} 个同账号重复项` : "";
         const capacityText = data.max_profiles ? ` / 上限 ${data.max_profiles}` : "";
-        if (store.persisted === false || store.error) {
-          authStatusBanner.className = "status-banner error";
-          const reason = store.error ? `：${store.error}` : "";
-          authStatusBanner.textContent = `已加载 ${data.profiles?.length || 0} 个登录态，但本地加密存储异常${reason}。当前进程中的账号变更可能在重启后丢失${dupText}`;
-        } else {
-          authStatusBanner.className = "status-banner success";
-          authStatusBanner.textContent = `已安全加载 ${data.profiles?.length || 0} 个登录态${capacityText} (DPAPI 加密)${savedTime}${dupText}`;
+        if (!state.browserLoginBusy && !state.manualCaptchaBusy) {
+          if (store.persisted === false || store.error) {
+            authStatusBanner.className = "status-banner error";
+            const reason = store.error ? `：${store.error}` : "";
+            authStatusBanner.textContent = `已加载 ${data.profiles?.length || 0} 个登录态，但本地加密存储异常${reason}。当前进程中的账号变更可能在重启后丢失${dupText}`;
+          } else {
+            authStatusBanner.className = "status-banner success";
+            authStatusBanner.textContent = `已安全加载 ${data.profiles?.length || 0} 个登录态${capacityText} (DPAPI 加密)${savedTime}${dupText}`;
+          }
         }
         return true;
       } catch (err) {
@@ -953,11 +1024,11 @@
         state.playwrightAvailable = data.playwright_available !== false;
         btnBrowserLogin.disabled = state.browserLoginBusy || !state.playwrightAvailable;
         btnBrowserLogin.title = state.playwrightAvailable
-          ? "打开官方页面获取登录态"
+          ? "弹出官方登录窗口，手动完成拼图验证码后自动抓取登录态"
           : "未安装可选 Playwright 组件；请使用 Token/HAR，或先安装 requirements.txt";
         const browserLoginLabel = btnBrowserLogin.querySelector("span");
         if (browserLoginLabel) {
-          browserLoginLabel.textContent = state.playwrightAvailable ? "拉起官方浏览器登录" : "浏览器登录组件未安装";
+          browserLoginLabel.textContent = state.playwrightAvailable ? "浏览器登录（手动过拼图）" : "浏览器登录组件未安装";
         }
         state.activeProfileId = data.active_profile_id || "";
         state.chatBusy = Boolean(data.chat_busy);
@@ -1168,6 +1239,10 @@
       const card = event.target.closest("[data-profile-key]");
       const profileId = target?.dataset.profileKey || card?.dataset.profileKey || "";
       if (!profileId) return;
+      if (target?.dataset.profileAction === "captcha") {
+        requestManualCaptcha(profileId);
+        return;
+      }
       selectProfileCard(profileId);
       if (!target) return;
       if (target.dataset.profileAction === "remove") btnRemoveProfile.click();
@@ -1271,9 +1346,10 @@
       const label = profileNameInput.value.trim() || "browser login";
       state.browserLoginBusy = true;
       btnBrowserLogin.disabled = true;
+      renderAccountPool({ profiles: state.profiles, concurrency: state.concurrency, active_profile_id: state.activeProfileId });
       authStatusBanner.className = "status-banner standby";
-      authStatusBanner.textContent = "正在拉起官方 Chrome 窗口...";
-      window.showToast("已打开浏览器登录窗口，请在官方页面完成登录");
+      authStatusBanner.textContent = "正在拉起官方浏览器，请在弹出窗口完成登录和拼图验证码...";
+      window.showToast("已打开浏览器登录窗口，请在官方页面完成登录和拼图验证码");
       const loginStartedAt = Date.now();
       let loginPollBusy = false;
       let loginPolling = true;
@@ -1311,7 +1387,7 @@
         updateSessionUI();
         await reloadAllData();
         applyProfileSessionFilter();
-        showProfileMutationResult(data, `浏览器登录成功并已加密保存: ${data.profile.label} · 验证码将由本地求解器自动处理`);
+        showProfileMutationResult(data, `浏览器登录成功并已加密保存: ${data.profile.label} · 登录拼图验证码已手动完成`);
       } catch (err) {
         authStatusBanner.className = "status-banner error";
         authStatusBanner.textContent = `浏览器登录失败: ${err.message}`;
@@ -1321,6 +1397,7 @@
         clearInterval(loginPollTimer);
         state.browserLoginBusy = false;
         btnBrowserLogin.disabled = !state.playwrightAvailable;
+        renderAccountPool({ profiles: state.profiles, concurrency: state.concurrency, active_profile_id: state.activeProfileId });
       }
     });
 
@@ -1365,7 +1442,7 @@
     btnTokenLogin.addEventListener("click", async () => {
       const token = tokenInput.value.trim();
       if (!token) {
-        window.showToast("请先粘贴 chat.z.ai 会话 token", "error");
+        window.showToast("请先粘贴 zchat.z.ai 会话 token", "error");
         return;
       }
       const label = profileNameInput.value.trim();

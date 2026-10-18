@@ -543,7 +543,7 @@ class RuntimeMetrics:
 RUNTIME_METRICS = RuntimeMetrics()
 
 
-BASE_URL = "https://chat.z.ai"
+BASE_URL = "https://zchat.z.ai"
 SERVICE_ID = "glm2api"
 DEFAULT_MODEL = "glm-5.3"
 # x-preview-l is the upstream model ID behind the GLM-5.3-Flash UI entry.
@@ -568,7 +568,7 @@ ADVERTISED_MODELS = (
     "glm-5.2-forcehistory",
 )
 MODEL = DEFAULT_MODEL
-FE_VERSION = "prod-fe-1.1.92"
+FE_VERSION = "prod-fe-1.1.107"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
@@ -576,7 +576,7 @@ DEFAULT_USER_AGENT = (
 # Page <title> observed on every chat/completions request in both 2026-08 HARs;
 # it mirrors the site banner (GLM-5.3-Flash branding) regardless of routed model.
 PAGE_TITLE = "Z.ai - Advanced AI Chatbot & Agent powered by GLM-5.3-Flash"
-REGION = "overseas"
+REGION = "cn"
 WEB_ROOT_PATH = Path(__file__).with_name("web")
 WEB_INDEX_PATH = WEB_ROOT_PATH / "index.html"
 WEB_STYLE_PATH = WEB_ROOT_PATH / "styles.css"
@@ -939,7 +939,7 @@ API_KEY_STORE_PATH = Path(__file__).with_name("apikey.local.json")
 MAX_LOCAL_API_KEY_CHARS = 4096
 MAX_API_KEY_STORE_BYTES = 64 * 1024
 
-# Recovered from the production front-end bundle in chat.z.ai.har.
+# Recovered from the production front-end bundle in zchat.z.ai.har.
 SIGNING_SEED = "key-@@@@)))()((9))-xxxx&&&%%%%%"
 
 
@@ -1229,10 +1229,9 @@ def _captcha_playwright() -> Callable[..., Any]:
     return _CAPTCHA_PLAYWRIGHT
 
 
-CAPTCHA_EVALUATE_SCRIPT = """async (timeoutMs) => {
+CAPTCHA_EVALUATE_SCRIPT = """async ({timeoutMs, sceneId, region, prefix, manual}) => {
                   const scriptUrl = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
-                  const sceneId = location.hostname === "chat.z.ai" ? "didk33e0" : "xswyjefn";
-                  window.AliyunCaptchaConfig = {region: "sgp", prefix: "no8xfe"};
+                  window.AliyunCaptchaConfig = {region, prefix};
                   if (!window.initAliyunCaptcha) {
                     await new Promise((resolve, reject) => {
                       let s = document.querySelector(`script[src="${scriptUrl}"]`);
@@ -1265,6 +1264,17 @@ CAPTCHA_EVALUATE_SCRIPT = """async (timeoutMs) => {
                     button.tabIndex = -1;
                     button.style.cssText = "position:absolute;left:-99999px;top:-99999px;width:1px;height:1px;opacity:0;";
                     document.body.appendChild(button);
+                  }
+
+                  if (manual) {
+                    let banner = document.getElementById("codex-chat-captcha-manual-banner");
+                    if (!banner) {
+                      banner = document.createElement("div");
+                      banner.id = "codex-chat-captcha-manual-banner";
+                      banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#111827;color:#fff;padding:12px 16px;text-align:center;font:16px/1.5 system-ui,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.35);";
+                      banner.textContent = "请完成拼图验证码；验证成功后窗口会自动关闭。";
+                      document.body.appendChild(banner);
+                    }
                   }
 
                   const lang = {
@@ -1303,7 +1313,19 @@ CAPTCHA_EVALUATE_SCRIPT = """async (timeoutMs) => {
                         try { inst && inst.refresh && inst.refresh(); } catch (e) {}
                         resolve(v);
                       },
-                      fail: () => setTimeout(() => button.click(), 300),
+                      fail: (e) => {
+                        const rejected = e && typeof e === "object" && e.verifyResult === false;
+                        if (!manual && rejected) {
+                          // A PUZZLE challenge needs a human drag. Retrying
+                          // headlessly only burns the request timeout, so fail
+                          // fast and let the UI offer the manual button.
+                          clearTimeout(timer);
+                          const code = e.verifyCode || e.code || "";
+                          reject(new Error("puzzle challenge requires manual completion" + (code ? ` (${code})` : "")));
+                          return;
+                        }
+                        setTimeout(() => button.click(), 300);
+                      },
                       onError: (e) => {
                         clearTimeout(timer);
                         reject(new Error(typeof e === "string" ? e : JSON.stringify(e || {})));
@@ -1329,23 +1351,72 @@ def _launch_captcha_page(
     timeout_ms: int,
     selected_model: str,
 ) -> tuple[Any, Any, Any]:
-    """Launch a preloaded chat.z.ai page with the account token and telemetry."""
+    """Launch a preloaded zchat.z.ai page with the account token and telemetry."""
     executable_path = chrome_path or default_chrome_path()
     launch_args = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+    if not headless:
+        launch_args.append("--start-maximized")
     user_agent = state.user_agent or DEFAULT_USER_AGENT
     launch_kwargs: dict[str, Any] = {"headless": headless, "args": launch_args}
     if executable_path:
         launch_kwargs["executable_path"] = executable_path
     browser = pw.chromium.launch(**launch_kwargs)
     try:
-        context = browser.new_context(
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            user_agent=user_agent,
-            viewport={"width": int(state.viewport_width or "1152"), "height": int(state.viewport_height or "932")},
-            device_scale_factor=float(state.pixel_ratio or "1.5"),
-        )
+        context_kwargs: dict[str, Any] = {
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
+            "user_agent": user_agent,
+        }
+        if headless:
+            context_kwargs["viewport"] = {
+                "width": int(state.viewport_width or "1152"),
+                "height": int(state.viewport_height or "932"),
+            }
+            context_kwargs["device_scale_factor"] = float(state.pixel_ratio or "1.5")
+        else:
+            context_kwargs["no_viewport"] = True
+        context = browser.new_context(**context_kwargs)
         page = context.new_page()
+        if not headless:
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+
+        def _log_console(msg: Any) -> None:
+            try:
+                if str(msg.type) in {"error", "warning"}:
+                    log_event(
+                        "captcha_page_console",
+                        level=msg.type,
+                        text=str(msg.text)[:300],
+                    )
+            except Exception:
+                pass
+
+        def _log_page_error(exc: Any) -> None:
+            try:
+                log_event("captcha_page_error", error=str(exc)[:300])
+            except Exception:
+                pass
+
+        def _log_failed_request(req: Any) -> None:
+            try:
+                url = str(req.url)
+                if "captcha" in url.lower() or "alicdn" in url.lower():
+                    log_event(
+                        "captcha_page_request_failed",
+                        url=url[:200],
+                        failure=str(req.failure)[:200],
+                    )
+            except Exception:
+                pass
+
+        register_event = getattr(page, "on", None)
+        if callable(register_event):
+            register_event("console", _log_console)
+            register_event("pageerror", _log_page_error)
+            register_event("requestfailed", _log_failed_request)
         page.goto(BASE_URL + "/", wait_until="domcontentloaded", timeout=timeout_ms)
         page.evaluate(
             """(args) => {
@@ -1367,11 +1438,39 @@ def _launch_captcha_page(
         raise
 
 
-def solve_captcha_on_page(page: Any, timeout_ms: int) -> str:
+class CaptchaPuzzleRequired(RuntimeError):
+    """The Aliyun challenge is a PUZZLE and needs a visible manual solve."""
+
+
+def solve_captcha_on_page(page: Any, timeout_ms: int, *, manual: bool = False) -> str:
     """Run AliyunCaptcha on an existing preloaded page; return captcha_verify_param."""
-    result = page.evaluate(CAPTCHA_EVALUATE_SCRIPT, timeout_ms)
+    config = current_captcha_config()
+    # Automatic solves should fail fast so the worker can rebuild the page and
+    # retry within the caller's budget. A manual window needs the full timeout
+    # because the user is completing the puzzle.
+    internal_timeout = timeout_ms if manual else min(timeout_ms, 25_000)
+    try:
+        result = page.evaluate(
+            CAPTCHA_EVALUATE_SCRIPT,
+            {
+                "timeoutMs": internal_timeout,
+                "sceneId": config["scene"],
+                "region": config["region"],
+                "prefix": config["prefix"],
+                "manual": manual,
+            },
+        )
+    except Exception as exc:
+        if "puzzle challenge requires manual completion" in str(exc):
+            raise CaptchaPuzzleRequired(str(exc)) from exc
+        raise
     if not isinstance(result, str) or not result:
         raise RuntimeError(f"captcha success returned unexpected value: {type(result).__name__}")
+    if len(result) < MIN_CAPTCHA_VERIFY_PARAM_CHARS:
+        raise CaptchaPuzzleRequired(
+            f"captcha solver returned a degraded result ({len(result)} chars); "
+            "the current challenge is a puzzle and must be completed manually"
+        )
     return result
 
 
@@ -1381,6 +1480,7 @@ def get_browser_captcha(
     headless: bool = True,
     timeout_ms: int = 75_000,
     selected_model: str = DEFAULT_MODEL,
+    manual: bool = False,
 ) -> str:
     """Single-shot fallback: open a browser, solve once, close it immediately."""
     pw = _captcha_playwright()()
@@ -1397,6 +1497,8 @@ def get_browser_captcha(
             selected_model=selected_model,
         )
         try:
+            if manual:
+                return solve_captcha_on_page(page, timeout_ms, manual=True)
             return solve_captcha_on_page(page, timeout_ms)
         finally:
             browser.close()
@@ -1644,6 +1746,16 @@ class CaptchaWorker:
                     current_device = item.state.device_id
                     value = solve_captcha_on_page(page, solve_timeout_ms)
                     self._publish(item, value)
+                except CaptchaPuzzleRequired as exc:
+                    # Rebuilding the page cannot solve a PUZZLE; publish the
+                    # fast failure and leave a clean page for the next item.
+                    self._teardown_browser(browser)
+                    browser = None
+                    page = None
+                    current_token = ""
+                    current_device = ""
+                    self._publish(item, exc)
+                    continue
                 except Exception:
                     self._teardown_browser(browser)
                     browser = None
@@ -1748,6 +1860,46 @@ _CAPTCHA_DEGRADED_LOCK = threading.RLock()
 CAPTCHA_DEGRADED_COOLDOWN_SECONDS = 1800
 CAPTCHA_RETRY_BACKOFF_SECONDS = 20
 
+# Manually captured captchas are one-shot and short-lived. Keyed by upstream
+# user_id and stored with their value, so every saved profile of the same
+# account can consume the capture even if only one profile's state was updated.
+_MANUAL_CAPTCHA_LOCK = threading.RLock()
+_MANUAL_CAPTCHA_CAPTURES: dict[str, tuple[str, float]] = {}
+MANUAL_CAPTCHA_TTL_SECONDS = 90.0
+MANUAL_CAPTCHA_MAX_ENTRIES = 128
+
+
+def _record_manual_captcha(state: "HarState") -> None:
+    key = str(getattr(state, "user_id", "") or "").strip()
+    value = str(getattr(state, "captcha_verify_param", "") or "")
+    if not key or not value:
+        return
+    now = time.time()
+    with _MANUAL_CAPTCHA_LOCK:
+        _MANUAL_CAPTCHA_CAPTURES[key] = (value, now)
+        if len(_MANUAL_CAPTCHA_CAPTURES) > MANUAL_CAPTCHA_MAX_ENTRIES:
+            for item_key, (_item_value, captured_at) in list(_MANUAL_CAPTCHA_CAPTURES.items()):
+                if now - captured_at > MANUAL_CAPTCHA_TTL_SECONDS:
+                    _MANUAL_CAPTCHA_CAPTURES.pop(item_key, None)
+            while len(_MANUAL_CAPTCHA_CAPTURES) > MANUAL_CAPTCHA_MAX_ENTRIES:
+                _MANUAL_CAPTCHA_CAPTURES.pop(next(iter(_MANUAL_CAPTCHA_CAPTURES)), None)
+
+
+def _take_fresh_manual_captcha(state: "HarState") -> str:
+    """Return and consume a recent manual capture, or "" when absent/expired."""
+    key = str(getattr(state, "user_id", "") or "").strip()
+    if not key:
+        return ""
+    now = time.time()
+    with _MANUAL_CAPTCHA_LOCK:
+        capture = _MANUAL_CAPTCHA_CAPTURES.pop(key, None)
+    if capture is None:
+        return ""
+    value, captured_at = capture
+    if captured_at and now - captured_at <= MANUAL_CAPTCHA_TTL_SECONDS:
+        return value
+    return ""
+
 
 def captcha_worker_status() -> dict[str, int | bool]:
     worker = _CAPTCHA_WORKER
@@ -1771,6 +1923,36 @@ HAPPYDOM_CAPTCHA_SCRIPT = Path(__file__).with_name("captcha_happy.mjs")
 HAPPYDOM_PACKAGE_MANIFEST = Path(__file__).with_name("node_modules") / "happy-dom" / "package.json"
 _HAPPYDOM_AVAILABLE: bool | None = None
 _CAPTCHA_MODE = "auto"
+
+# Live chat/completions captcha values from the zchat.z.ai and chat.z.ai
+# frontend bundles (prod-fe-1.1.107, verified 2026-10-18):
+#   zchat.z.ai -> SceneId xswyjefn, region cn, prefix no8xfe
+#   chat.z.ai  -> SceneId didk33e0, region cn, prefix no8xfe
+# The login page uses a different scene (1nl1cfkp); it is solved manually in
+# the official login window and never goes through these chat solvers.
+CAPTCHA_REGION = "cn"
+CAPTCHA_PREFIX = "no8xfe"
+CAPTCHA_SCENE_ZCHAT = "xswyjefn"
+CAPTCHA_SCENE_CHAT = "didk33e0"
+# A real verify param is ~280 chars of base64 JSON. The SDK also emits a
+# 48-char degraded value when a puzzle was not completed; 100 separates the
+# two without rejecting a shorter-than-usual valid value.
+MIN_CAPTCHA_VERIFY_PARAM_CHARS = 100
+
+
+def captcha_config_for_host(host: str) -> dict[str, str]:
+    """Return the Aliyun captcha scene/region/prefix for a chat host."""
+    normalized = str(host or "").strip().lower()
+    scene = CAPTCHA_SCENE_CHAT if normalized == "chat.z.ai" else CAPTCHA_SCENE_ZCHAT
+    return {
+        "scene": os.environ.get("CAPTCHA_SCENE") or scene,
+        "region": os.environ.get("CAPTCHA_REGION") or CAPTCHA_REGION,
+        "prefix": os.environ.get("CAPTCHA_PREFIX") or CAPTCHA_PREFIX,
+    }
+
+
+def current_captcha_config() -> dict[str, str]:
+    return captcha_config_for_host(urlsplit(BASE_URL).hostname or "")
 
 
 def happydom_captcha_available() -> bool:
@@ -1804,10 +1986,18 @@ def _terminate_subprocess(proc: subprocess.Popen[str]) -> None:
             pass
 
 
+def _captcha_log_detail(value: str) -> str:
+    """Bound a solver diagnostic and redact token-like runs."""
+    text = " ".join(str(value or "").split())
+    text = re.sub(r"[A-Za-z0-9+/=_-]{80,}", "<redacted>", text)
+    return client_error_message(text, fallback="")[:300]
+
+
 def get_happydom_captcha(
     timeout_ms: int = 75_000,
     *,
     cancel_check: Callable[[], None] | None = None,
+    config: dict[str, str] | None = None,
 ) -> str:
     """Solve the AliyunCaptcha challenge via the local happy-dom Node script.
 
@@ -1817,10 +2007,23 @@ def get_happydom_captcha(
     node = shutil.which("node")
     if not node or not happydom_captcha_available():
         return ""
+    config = config or current_captcha_config()
     proc: subprocess.Popen[str] | None = None
+    stderr_text = ""
     try:
         proc = subprocess.Popen(
-            [node, str(HAPPYDOM_CAPTCHA_SCRIPT), "--timeout-ms", str(max(timeout_ms, 30_000))],
+            [
+                node,
+                str(HAPPYDOM_CAPTCHA_SCRIPT),
+                "--timeout-ms",
+                str(max(timeout_ms, 30_000)),
+                "--scene",
+                config["scene"],
+                "--region",
+                config["region"],
+                "--prefix",
+                config["prefix"],
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1832,9 +2035,10 @@ def get_happydom_captcha(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_subprocess(proc)
+                log_event("captcha_happydom_timeout", scene=config["scene"], region=config["region"])
                 return ""
             try:
-                stdout, _stderr = proc.communicate(timeout=min(0.25, remaining))
+                stdout, stderr_text = proc.communicate(timeout=min(0.25, remaining))
                 break
             except subprocess.TimeoutExpired:
                 if cancel_check is not None:
@@ -1850,11 +2054,19 @@ def get_happydom_captcha(
     except (OSError, subprocess.SubprocessError):
         if proc is not None:
             _terminate_subprocess(proc)
+        log_event("captcha_happydom_failed", error="solver process failed")
         return ""
     lines = (stdout or "").strip().splitlines()
     payload = json_or_none(lines[-1]) if lines else None
     if isinstance(payload, dict) and payload.get("ok") and payload.get("captcha"):
         return str(payload["captcha"])
+    detail = _captcha_log_detail(stderr_text or (lines[-1] if lines else "solver returned no captcha"))
+    log_event(
+        "captcha_happydom_failed",
+        error=detail or "solver returned no captcha",
+        scene=config["scene"],
+        region=config["region"],
+    )
     return ""
 
 
@@ -1895,6 +2107,13 @@ def resolve_fresh_captcha(
     """
     if cancel_check is not None:
         cancel_check()
+    # A user-captured code is already fresh and one-shot; use it before any
+    # cached or automatic path so the manual button takes effect immediately.
+    if not force_fresh:
+        manual = _take_fresh_manual_captcha(state)
+        if manual:
+            log_event("fresh_captcha_manual_hit")
+            return manual
     # 预热池仅由 happy-dom 产生；显式 browser 模式必须严格使用浏览器求解，
     # 不能意外消费上一次 auto/happydom 模式遗留的池码。
     if not force_fresh and _CAPTCHA_MODE in {"auto", "happydom"}:
@@ -1921,6 +2140,7 @@ def resolve_fresh_captcha(
         _set_captcha_degraded(0)
     last_exc: Exception | None = None
     started = time.time()
+    captcha_cfg = current_captcha_config()
     want_happydom = _CAPTCHA_MODE in ("auto", "happydom") and happydom_captcha_available()
     want_browser = _CAPTCHA_MODE in ("auto", "browser")
     for attempt in range(2):
@@ -1947,6 +2167,12 @@ def resolve_fresh_captcha(
                 backend = "browser"
             except ServiceShuttingDown:
                 raise
+            except CaptchaPuzzleRequired as exc:
+                # A PUZZLE challenge cannot be solved headlessly; retrying
+                # only adds the 20s backoff. Fail immediately and let the UI
+                # offer the visible manual button.
+                last_exc = exc
+                break
             except Exception as exc:
                 last_exc = exc
         if captcha:
@@ -1956,6 +2182,9 @@ def resolve_fresh_captcha(
                 "fresh_captcha_solved",
                 backend=backend,
                 attempt=attempt + 1,
+                scene=captcha_cfg["scene"],
+                region=captcha_cfg["region"],
+                prefix=captcha_cfg["prefix"],
                 elapsed_ms=int((time.time() - started) * 1000),
             )
             return captcha
@@ -1968,11 +2197,15 @@ def resolve_fresh_captcha(
         error_type=type(last_exc).__name__ if last_exc else "empty",
         error=str(last_exc)[:300] if last_exc else f"{_CAPTCHA_MODE} captcha solver returned empty result",
         has_stored_captcha=bool(fallback),
+        scene=captcha_cfg["scene"],
+        region=captcha_cfg["region"],
+        prefix=captcha_cfg["prefix"],
     )
-    if fallback:
+    if fallback and not isinstance(last_exc, CaptchaPuzzleRequired):
         return fallback
     raise RuntimeError(
-        "验证码获取失败：请确认本地求解器可用，或在网页面板重新登录/切换账号后重试。"
+        "验证码获取失败：请确认本地求解器可用；当前可能是拼图验证码，"
+        "请在账号页点击「手动验证码」完成拼图后重试。"
     ) from last_exc
 
 
@@ -2043,7 +2276,7 @@ def get_browser_login_state(
     """Open a real browser for manual login and collect post-login state.
 
     The local web UI never receives the password. The user completes login and
-    any official CAPTCHA in the opened chat.z.ai browser window. After a
+    any official CAPTCHA in the opened zchat.z.ai browser window. After a
     non-guest token is observed, we read only the session token and browser
     telemetry required by the existing completion client.
     """
@@ -2053,7 +2286,11 @@ def get_browser_login_state(
         raise RuntimeError("Playwright Python package is unavailable; install/playwright-enable it first") from exc
 
     executable_path = chrome_path or default_chrome_path()
-    launch_args = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--start-maximized",
+    ]
     deadline = time.monotonic() + timeout_ms / 1000
 
     def report(stage: str) -> None:
@@ -2076,17 +2313,22 @@ def get_browser_login_state(
             launch_kwargs["executable_path"] = executable_path
         browser = p.chromium.launch(**launch_kwargs)
         try:
-            context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
+            # A maximized, viewport-free window is important for the puzzle
+            # captcha: the official login page must be visible and usable.
+            context = browser.new_context(
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                no_viewport=True,
+            )
             page = context.new_page()
-            _navigate_browser_login_page(page, deadline=deadline, cancel_check=cancel_check)
-            report("授权浏览器已打开，请在窗口中完成登录")
-
-            captured_token: dict[str, str] = {"value": ""}
-            initial_token = ""
             try:
-                initial_token = str(page.evaluate("() => localStorage.getItem('token') || ''") or "")
+                page.bring_to_front()
             except Exception:
                 pass
+            _navigate_browser_login_page(page, deadline=deadline, cancel_check=cancel_check)
+            report("授权浏览器已打开，请在窗口中完成登录和拼图验证码")
+
+            captured_token: dict[str, str] = {"value": ""}
 
             def _jwt_claims(tok: str) -> dict[str, Any]:
                 try:
@@ -2104,7 +2346,9 @@ def get_browser_login_state(
                 return bool(role == "guest" or email.lower().endswith("@guest.com"))
 
             def _looks_real(tok: str) -> bool:
-                return bool(tok) and tok != initial_token and not _is_guest_token(tok)
+                # A pre-existing non-guest token means the window is already
+                # authenticated; capturing it immediately is correct.
+                return bool(tok) and not _is_guest_token(tok)
 
             def log_login_event(kind: str, detail: str) -> None:
                 try:
@@ -2115,7 +2359,10 @@ def get_browser_login_state(
             def on_request(request: Any) -> None:
                 try:
                     url = str(request.url)
-                    if "chat.z.ai" in url and "/api/" in url:
+                    host = (urlsplit(url).hostname or "").lower()
+                    if (
+                        host in {"zchat.z.ai", "chat.z.ai"} or host.endswith(".zchat.z.ai")
+                    ) and "/api/" in url:
                         auth = str(request.headers.get("authorization") or "")
                         tok = ""
                         if auth.lower().startswith("bearer "):
@@ -2146,7 +2393,9 @@ def get_browser_login_state(
                             if not response.ok:
                                 detail = str(data.get("detail") or data.get("message") or "")
                                 log_login_event("signin_failed", f"status={response.status} detail={detail[:160]}")
-                                if detail:
+                                if "captcha" in detail.lower() or "验证" in detail:
+                                    report("请在浏览器窗口中完成拼图验证码后继续登录")
+                                elif detail:
                                     report("登录未成功：" + detail + "（可修改后重试，窗口保持打开）")
                 except Exception:
                     pass
@@ -2159,8 +2408,17 @@ def get_browser_login_state(
                     pass
 
             attach_page_hooks(page)
+
+            def on_new_page(pg: Any) -> None:
+                attach_page_hooks(pg)
+                try:
+                    pg.bring_to_front()
+                except Exception:
+                    pass
+                log_login_event("page_opened", pg.url[:220])
+
             try:
-                context.on("page", lambda pg: (attach_page_hooks(pg), log_login_event("page_opened", pg.url[:220])))
+                context.on("page", on_new_page)
             except Exception:
                 pass
             context.on("request", on_request)
@@ -2300,6 +2558,18 @@ def get_browser_login_state(
                     last_capture = capture or {}
                     token = str((capture or {}).get("token") or "")
                     auth = (capture or {}).get("auth") or {}
+                    if token and not (isinstance(auth, dict) and auth.get("id")):
+                        # The auth endpoint may differ on the China site; the
+                        # token payload still identifies the account.
+                        claims = _jwt_claims(token)
+                        claim_id = str(claims.get("id") or claims.get("sub") or claims.get("user_id") or "")
+                        if claim_id:
+                            auth = {
+                                "id": claim_id,
+                                "name": str(claims.get("name") or claims.get("email") or "browser-user"),
+                                "email": str(claims.get("email") or ""),
+                                "role": str(claims.get("role") or ""),
+                            }
                     real_token = ""
                     real_auth: dict[str, Any] = {}
                     if token and isinstance(auth, dict) and auth.get("id") and auth.get("role") != "guest":
@@ -2557,7 +2827,7 @@ def normalize_model(value: Any = _MISSING) -> str:
         "5-turbo": TURBO_MODEL,
         "turbo": TURBO_MODEL,
         # Common OpenAI-compatible model IDs. They remain response aliases;
-        # only the selected GLM model reaches chat.z.ai upstream.
+        # only the selected GLM model reaches zchat.z.ai upstream.
         "gpt-5": "glm-5.3",
         "gpt-5.1": "glm-5.3",
         "gpt-5.2": "glm-5.3",
@@ -2828,13 +3098,13 @@ def profile_source_display(source: str) -> tuple[str, str]:
 
 
 def jwt_payload_claims(token: str) -> dict[str, Any]:
-    """Decode the payload segment of a chat.z.ai session JWT (no signature check)."""
+    """Decode the payload segment of a zchat.z.ai session JWT (no signature check)."""
     token = str(token or "").strip()
     if len(token) > MAX_SESSION_TOKEN_CHARS:
         raise ValueError(f"token 超过 {MAX_SESSION_TOKEN_CHARS} 字符限制")
     parts = token.split(".")
     if len(parts) != 3 or not all(parts):
-        raise ValueError("token 必须是 chat.z.ai 的三段式 JWT（形如 eyJ....xxx....xxx）")
+        raise ValueError("token 必须是 zchat.z.ai 的三段式 JWT（形如 eyJ....xxx....xxx）")
     padded = parts[1] + "=" * (-len(parts[1]) % 4)
     try:
         claims = json.loads(
@@ -2857,7 +3127,7 @@ def synthesize_device_id() -> str:
 def refresh_state_browser_version(state: HarState) -> None:
     """Align logins captured months ago with the current front-end fingerprint.
 
-    chat.z.ai ships a new bundle (x-fe-version) and users upgrade Chrome over
+    zchat.z.ai ships a new bundle (x-fe-version) and users upgrade Chrome over
     time; replaying an old UA/fe-version pair from a stored profile stands out,
     so stale values are refreshed in memory to the current constants.
     """
@@ -2867,6 +3137,8 @@ def refresh_state_browser_version(state: HarState) -> None:
         state.sec_ch_ua = default_sec_ch_ua(DEFAULT_USER_AGENT)
     if str(state.fe_version or "") != FE_VERSION:
         state.fe_version = FE_VERSION
+    if str(state.region or "") != REGION:
+        state.region = REGION
     if not str(state.device_id or "").strip():
         state.device_id = synthesize_device_id()
 
@@ -2881,7 +3153,7 @@ def state_from_token(token: str) -> HarState:
     claims = jwt_payload_claims(token)
     user_id = str(claims.get("id") or claims.get("sub") or claims.get("user_id") or "")
     if not user_id:
-        raise ValueError("token payload 缺少用户 id，请确认复制的是 chat.z.ai 的会话 token")
+        raise ValueError("token payload 缺少用户 id，请确认复制的是 zchat.z.ai 的会话 token")
     return validate_har_state(HarState(
         token=token,
         user_id=user_id,
@@ -3383,8 +3655,8 @@ def query_params(state: HarState, prompt: str, chat_id: str) -> tuple[str, str]:
         "pathname": f"/c/{chat_id}" if chat_id else "/",
         "search": "",
         "hash": "",
-        "host": "chat.z.ai",
-        "hostname": "chat.z.ai",
+        "host": "zchat.z.ai",
+        "hostname": "zchat.z.ai",
         "protocol": "https:",
         "referrer": "",
         "title": PAGE_TITLE,
@@ -3436,7 +3708,7 @@ def control_accept_language(state: HarState) -> str:
 
 
 def browser_client_hint_headers(state: HarState) -> dict[str, str]:
-    """Fetch metadata and Client Hints observed on chat.z.ai same-origin XHRs.
+    """Fetch metadata and Client Hints observed on zchat.z.ai same-origin XHRs.
 
     These headers are not used for local CORS.  They make server-to-server
     control requests look like the browser HAR; missing `Sec-Fetch-*` caused
@@ -5760,7 +6032,9 @@ def stream_zai_completion(
                 )
             if cancel_check is not None:
                 cancel_check()
-            captcha = captcha_verify_param
+            # Default (on-demand) mode uses the account's stored/manual captcha
+            # instead of pre-solving a fresh one for every request.
+            captcha = captcha_verify_param or state.captcha_verify_param
             if fresh_captcha_browser:
                 # 每个 attempt 重新求解：繁忙失败的那次请求可能已消费掉旧 captcha。
                 # 上游刚以 F018/F019 拒绝过验证码时强制现场重解，绝不再取可能超龄的池码。
@@ -7120,7 +7394,7 @@ def prompt_from_openai_messages(messages: Any) -> str:
 # ---------------------------------------------------------------------------
 #
 # OpenAI Chat/Responses and Anthropic Messages are intentionally normalized
-# here, before any chat.z.ai-specific request is assembled.  Keeping this
+# here, before any zchat.z.ai-specific request is assembled.  Keeping this
 # layer separate from HTTP renderers prevents subtle drift between protocols:
 # the same prompt, tool policy, context-file behavior, and upstream completion
 # are used regardless of the client SDK.
@@ -8528,29 +8802,30 @@ def strip_markdown_fenced_blocks(text: str) -> str:
     return protected
 
 
+# Full-width punctuation and smart quotes are a frequent side effect of
+# multilingual generation. Normalize only characters used by the tag shell.
+TOOL_TAG_CHAR_TRANSLATION = str.maketrans(
+    {
+        "＜": "<",
+        "＞": ">",
+        "〈": "<",
+        "〉": ">",
+        "﹤": "<",
+        "﹥": ">",
+        "｜": "|",
+        "／": "/",
+        "＝": "=",
+        "＂": '"',
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+    }
+)
+
+
 def canonicalize_dsml_tool_markup(markup: str) -> str:
-    # Full-width punctuation and smart quotes are a frequent side effect of
-    # multilingual generation. Normalize only characters used by the tag shell.
-    markup = str(markup or "").translate(
-        str.maketrans(
-            {
-                "＜": "<",
-                "＞": ">",
-                "〈": "<",
-                "〉": ">",
-                "﹤": "<",
-                "﹥": ">",
-                "｜": "|",
-                "／": "/",
-                "＝": "=",
-                "＂": '"',
-                "“": '"',
-                "”": '"',
-                "‘": "'",
-                "’": "'",
-            }
-        )
-    )
+    markup = str(markup or "").translate(TOOL_TAG_CHAR_TRANSLATION)
     # 实测上游会漂移 DSML 分隔符、下划线和大小写，甚至把前缀与本地名黏连。
     # 仅在标签壳内接受这些变体，避免改写参数正文中的普通标点。
     pattern = re.compile(
@@ -9068,6 +9343,380 @@ def strip_parsed_tool_markup(text: str) -> str:
         flags=re.IGNORECASE,
     )
     return _restore_markdown_fenced_blocks(protected, stashed).strip()
+
+
+REALTIME_TOOL_PREFIX_HOLD_LIMIT = 512
+REALTIME_TOOL_BLOCK_CHARS = 4 * 1024 * 1024
+REALTIME_JSON_HOLD_LIMIT = MAX_TOOL_ARGUMENTS_BYTES + 64 * 1024
+
+_TOOL_TAG_RE = re.compile(
+    r"<\s*(/?)\s*(?:\|{0,3}\s*DSML\s*\|{0,3}\s*)?"
+    r"([A-Za-z_][A-Za-z0-9_.-]*)([^>]*)>",
+    re.IGNORECASE,
+)
+
+
+def _canonical_realtime_tool_tag(tag: str) -> str:
+    lowered = str(tag or "").lower()
+    if lowered in {"toolcall", "toolcalls"}:
+        return "tool_calls"
+    if lowered == "functioncall":
+        return "function_call"
+    return lowered
+
+
+def _realtime_tool_start(buffer: str) -> int | None:
+    """Return the offset of the first executable tool-block opening tag."""
+    translated = buffer.translate(TOOL_TAG_CHAR_TRANSLATION)
+    for match in _TOOL_TAG_RE.finditer(translated):
+        if match.group(1):
+            continue
+        tag = _canonical_realtime_tool_tag(match.group(2))
+        tail = match.group(3)
+        dsml = "DSML" in match.group(0).upper()
+        if tag == "parameter":
+            # A standalone parameter tag is already malformed; consume it as
+            # a block instead of forwarding the markup as prose.
+            return match.start()
+        if tag not in {"tool_calls", "function_call", "glm2api_tool_calls", "invoke"} and not dsml:
+            continue
+        if tag == "invoke" and not re.search(r"\bname\s*=", tail, re.IGNORECASE):
+            continue
+        return match.start()
+    return None
+
+
+def _realtime_could_be_tool_prefix(tail: str) -> bool:
+    """Whether a partial tail could still grow into a tool opening tag.
+
+    Holding only these tails keeps ordinary prose such as ``a < b`` or
+    ``<div>`` moving at full speed while never exposing ``<|DSM`` before the
+    tag can be classified.
+    """
+    translated = tail.translate(TOOL_TAG_CHAR_TRANSLATION)
+    if not translated.startswith("<"):
+        return False
+    rest = translated[1:].lstrip()
+    if ">" in rest:
+        return False
+    rest = re.sub(r"^[|!！、\x02]{0,3}\s*", "", rest)
+    lowered = rest.lower()
+    if "dsml".startswith(lowered):
+        return True
+    if lowered.startswith("dsml"):
+        rest = rest[4:].lstrip()
+        rest = re.sub(r"^[|!！、\x02]{0,3}\s*", "", rest)
+        lowered = rest.lower()
+    if "glm2api_".startswith(lowered) or lowered.startswith("glm2api"):
+        if lowered.startswith("glm2api_"):
+            rest = rest[len("glm2api_") :]
+            lowered = rest.lower()
+        else:
+            return True
+    if not lowered:
+        return True
+    for name in ("tool_calls", "tool_call", "function_call", "invoke", "parameter"):
+        if name.startswith(lowered):
+            return True
+        if lowered.startswith(name):
+            following = lowered[len(name) : len(name) + 1]
+            if not following or following.isspace() or following in "/=":
+                return True
+    return False
+
+
+def _realtime_safe_text(buffer: str) -> tuple[str, str]:
+    """Split a buffer into safely forwardable text and a held tag prefix."""
+    if not buffer:
+        return "", ""
+    translated = buffer.translate(TOOL_TAG_CHAR_TRANSLATION)
+    positions = [index for index, char in enumerate(translated) if char == "<"]
+    for index in reversed(positions):
+        tail = buffer[index:]
+        if len(tail) > REALTIME_TOOL_PREFIX_HOLD_LIMIT:
+            continue
+        if _realtime_could_be_tool_prefix(tail):
+            return buffer[:index], tail
+    return buffer, ""
+
+
+def _realtime_json_tool_candidate(buffer: str) -> tuple[str, str, int] | None:
+    """Classify a complete leading JSON object as a tool wrapper or prose."""
+    start = len(buffer) - len(buffer.lstrip())
+    if start >= len(buffer) or buffer[start] != "{":
+        return None
+    located = _balanced_json_object(buffer, start)
+    if located is None:
+        return None
+    obj_text, end = located
+    parsed = json_or_none(obj_text)
+    if isinstance(parsed, dict):
+        calls = parsed.get("tool_calls") if "tool_calls" in parsed else parsed.get("calls")
+        if isinstance(calls, list):
+            return "tool", obj_text, end
+        if parsed.get("name") and ("arguments" in parsed or "input" in parsed):
+            return "tool", obj_text, end
+    return "ordinary", obj_text, end
+
+
+class _RealtimeToolBlockScanner:
+    """Incremental depth scanner for one tool block.
+
+    It keeps its position and depth across chunks, so a long argument is
+    scanned once instead of being re-parsed on every token.
+    """
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self.wrapper = False
+        self.seen_open = False
+        self.position = 0
+
+    def scan(self, buffer: str) -> int | None:
+        translated = buffer.translate(TOOL_TAG_CHAR_TRANSLATION)
+        while True:
+            match = _TOOL_TAG_RE.search(translated, self.position)
+            if match is None:
+                partial = translated.rfind("<", self.position)
+                self.position = partial if partial >= 0 else len(translated)
+                return None
+            self.position = match.end()
+            end = self._observe(match)
+            if end is not None:
+                return end
+
+    def _observe(self, match: re.Match[str]) -> int | None:
+        slash = bool(match.group(1))
+        tag = _canonical_realtime_tool_tag(match.group(2))
+        tail = match.group(3)
+        self_closing = tail.rstrip().endswith("/")
+        dsml = "DSML" in match.group(0).upper()
+        if tag not in {"tool_calls", "function_call", "glm2api_tool_calls", "invoke", "parameter"}:
+            if not dsml:
+                return None
+            # A DSML-prefixed tag that is not a known tool tag is a malformed
+            # block (for example `<|DSML|tools>`). Treat it as a wrapper so
+            # the block is consumed and suppressed instead of leaking text.
+            if slash:
+                self.depth = max(0, self.depth - 1)
+                return match.end() if self.wrapper and self.depth == 0 else None
+            self.wrapper = True
+            self.seen_open = True
+            self.depth += 1
+            return None
+        if tag == "parameter":
+            if slash or (dsml and "=" not in tail):
+                self.depth = max(0, self.depth - 1)
+            elif not self_closing:
+                self.depth += 1
+            return None
+        if tag in {"tool_calls", "function_call", "glm2api_tool_calls"}:
+            if slash:
+                self.depth = max(0, self.depth - 1)
+                return match.end() if self.wrapper and self.depth == 0 else None
+            if self_closing:
+                return match.end() if not self.wrapper else None
+            if dsml and self.depth > 0 and "=" not in tail:
+                self.depth = max(0, self.depth - 1)
+                return match.end() if self.wrapper and self.depth == 0 else None
+            self.wrapper = True
+            self.seen_open = True
+            self.depth += 1
+            return None
+        if tag == "invoke":
+            if slash:
+                self.depth = max(0, self.depth - 1)
+                if not self.wrapper and self.seen_open and self.depth == 0:
+                    return match.end()
+                return None
+            if self_closing:
+                return match.end() if not self.wrapper else None
+            if dsml and self.depth > 0 and "=" not in tail:
+                self.depth = max(0, self.depth - 1)
+                if not self.wrapper and self.seen_open and self.depth == 0:
+                    return match.end()
+                return None
+            self.seen_open = True
+            self.depth += 1
+            return None
+        return None
+
+
+class _MarkdownFenceTracker:
+    """Track fenced code blocks so examples are never executed as calls."""
+
+    def __init__(self) -> None:
+        self.marker_char = ""
+        self.marker_length = 0
+        self.line = ""
+
+    @property
+    def in_fence(self) -> bool:
+        return bool(self.marker_char)
+
+    @property
+    def detection_in_fence(self) -> bool:
+        if self.marker_char:
+            return True
+        return bool(re.match(r"^[ \t]*(`{3,}|~{3,})", self.line))
+
+    def feed(self, text: str) -> None:
+        if not text:
+            return
+        combined = self.line + text
+        lines = combined.split("\n")
+        self.line = lines[-1]
+        for line in lines[:-1]:
+            self._consume_line(line.rstrip("\r"))
+
+    def _consume_line(self, line: str) -> None:
+        trimmed = line.lstrip(" \t")
+        if not self.marker_char:
+            match = re.match(r"(`{3,}|~{3,})", trimmed)
+            if match:
+                self.marker_char = match.group(1)[0]
+                self.marker_length = len(match.group(1))
+            return
+        if re.match(
+            rf"{re.escape(self.marker_char)}{{{self.marker_length},}}[ \t]*$",
+            trimmed,
+        ):
+            self.marker_char = ""
+            self.marker_length = 0
+
+
+class RealtimeToolCallStream:
+    """Separate assistant prose from tool markup without whole-turn buffering.
+
+    ``feed`` returns ``("text", chunk)`` actions immediately for prose and
+    ``("tool_call", ToolCall)`` actions as soon as one complete invoke has
+    arrived.  Markup is never released as text.  A malformed block is
+    suppressed and recorded in ``malformed``; callers may then retry when no
+    client output has been sent yet, or report a protocol error otherwise.
+    """
+
+    def __init__(
+        self,
+        tools: list[dict[str, Any]],
+        policy: ToolChoice,
+        id_prefix: str = "call_",
+    ) -> None:
+        self.tools = tools
+        self.policy = policy
+        self.id_prefix = id_prefix
+        self.buffer = ""
+        self.in_block = False
+        self.calls: list[ToolCall] = []
+        self.malformed = False
+        self.tool_markup_seen = False
+        self.text_emitted = False
+        self._scanner = _RealtimeToolBlockScanner()
+        self._fence = _MarkdownFenceTracker()
+
+    def feed(self, delta: str) -> list[tuple[str, Any]]:
+        self.buffer += str(delta or "")
+        actions: list[tuple[str, Any]] = []
+        while self.buffer:
+            if self.in_block:
+                end = self._scanner.scan(self.buffer)
+                if end is None:
+                    break
+                block = self.buffer[:end]
+                self.buffer = self.buffer[end:]
+                self.in_block = False
+                self._parse_block(block, actions)
+                continue
+            if not self.text_emitted and not self.tool_markup_seen:
+                stripped = self.buffer.lstrip()
+                if stripped.startswith("{"):
+                    candidate = None
+                    if self.buffer.rstrip().endswith("}"):
+                        candidate = _realtime_json_tool_candidate(self.buffer)
+                    if candidate is None:
+                        # Wait for the JSON object to complete before deciding
+                        # whether it is a tool wrapper. Ordinary JSON answers
+                        # are released once the object closes (or at the hold
+                        # limit), so they are not delayed indefinitely.
+                        if len(self.buffer) <= REALTIME_JSON_HOLD_LIMIT:
+                            break
+                    else:
+                        kind, obj_text, end = candidate
+                        if kind == "tool":
+                            self.tool_markup_seen = True
+                            self._parse_block(obj_text, actions)
+                            self.buffer = self.buffer[end:]
+                            continue
+                        # Ordinary JSON: release it through the normal text
+                        # path immediately instead of holding the answer.
+            if self._fence.in_fence or self._fence.detection_in_fence:
+                self._emit_text(self.buffer, actions)
+                self.buffer = ""
+                break
+            start = _realtime_tool_start(self.buffer)
+            if start is None:
+                safe, hold = _realtime_safe_text(self.buffer)
+                if safe:
+                    self._emit_text(safe, actions)
+                    self.buffer = hold
+                break
+            if start > 0:
+                self._emit_text(self.buffer[:start], actions)
+                self.buffer = self.buffer[start:]
+                if self._fence.in_fence or self._fence.detection_in_fence:
+                    self._emit_text(self.buffer, actions)
+                    self.buffer = ""
+                    break
+            self.in_block = True
+            self.tool_markup_seen = True
+            self._scanner = _RealtimeToolBlockScanner()
+        if len(self.buffer) > REALTIME_TOOL_BLOCK_CHARS:
+            self.buffer = ""
+            self.in_block = False
+            self.malformed = True
+        return actions
+
+    def finish(self) -> list[tuple[str, Any]]:
+        actions: list[tuple[str, Any]] = []
+        if self.in_block:
+            block = self.buffer
+            self.buffer = ""
+            self.in_block = False
+            self.tool_markup_seen = True
+            self._parse_block(block, actions)
+        if self.buffer:
+            safe, hold = _realtime_safe_text(self.buffer)
+            if safe:
+                self._emit_text(safe, actions)
+            if hold:
+                self.tool_markup_seen = True
+                self.malformed = True
+            self.buffer = ""
+        return actions
+
+    def _emit_text(self, text: str, actions: list[tuple[str, Any]]) -> None:
+        if not text:
+            return
+        self._fence.feed(text)
+        actions.append(("text", text))
+        self.text_emitted = True
+
+    def _parse_block(self, block: str, actions: list[tuple[str, Any]]) -> None:
+        try:
+            calls = parse_tool_calls_from_output(
+                block,
+                self.tools,
+                self.policy,
+                id_prefix=self.id_prefix,
+            )
+        except ToolCallFormatError:
+            self.malformed = True
+            return
+        if not calls:
+            self.malformed = True
+            return
+        self.calls.extend(calls)
+        for call in calls:
+            actions.append(("tool_call", call))
 
 
 def estimate_protocol_tokens(text: str) -> int:
@@ -11077,13 +11726,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         thinking: str,
         regenerate: Callable[[ProtocolRequest], tuple[str, str, dict[str, Any], HarState]] | None,
         release_initial_output: Callable[[], None] | None = None,
+        *,
+        allow_retry: bool = True,
     ) -> ProtocolTurn:
         try:
             return self._complete_protocol_turn(request, state, context, text, thinking)
         except ToolCallFormatError as exc:
             # One bounded correction pass covers both missing required calls
-            # and recognizable-but-malformed call markup.
-            if regenerate is None:
+            # and recognizable-but-malformed call markup.  A real-time stream
+            # that already sent bytes must not replay the turn: that would
+            # duplicate prose or produce two tool-call ids for one request.
+            if regenerate is None or not allow_retry:
                 record_id = str(context.get("_history_record_id") or "")
                 finish_history_record(
                     record_id,
@@ -12294,10 +12947,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if path == "/api/auth/browser-login":
             self._handle_auth_browser_login()
             return
-        # 保留旧版客户端的手动验证码接口；当前网页不再暴露该入口。启用
-        # fresh-captcha 时优先使用本地 happy-dom，浏览器仅作为可选回退。
+        # 旧版手动采集接口保留兼容；账号卡片的新入口使用 captcha/manual，
+        # 不受 captcha mode 限制，始终打开可见窗口交给用户完成拼图。
         if path == "/api/auth/captcha-refresh":
             self._handle_auth_captcha_refresh()
+            return
+        if path == "/api/auth/captcha/manual":
+            self._handle_auth_captcha_refresh(manual=True)
             return
         if path == "/api/auth/switch":
             self._handle_auth_switch()
@@ -12361,11 +13017,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
         state = self._active_state()
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        buffer_for_tools = bool(request.tools) and request.tool_choice.mode != "none"
+        tools_active = bool(request.tools) and request.tool_choice.mode != "none"
+        tool_stream = (
+            RealtimeToolCallStream(
+                request.tools,
+                request.tool_choice,
+                id_prefix=tool_call_id_prefix(request.surface),
+            )
+            if tools_active
+            else None
+        )
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         stream_budget = UpstreamStreamBudget()
         last_client_write = time.monotonic()
+        client_output_emitted = False
+        text_streamed = False
+        thinking_streamed = False
+        tool_call_index = 0
 
         def keepalive_if_due() -> None:
             nonlocal last_client_write
@@ -12373,6 +13042,80 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if now - last_client_write >= SSE_KEEPALIVE_INTERVAL_SECONDS:
                 self._sse_keepalive()
                 last_client_write = now
+
+        def write_content_chunk(text: str) -> None:
+            nonlocal client_output_emitted, text_streamed, last_client_write
+            if not text:
+                return
+            self._write_openai_chunk(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.response_model,
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                }
+            )
+            client_output_emitted = True
+            text_streamed = True
+            last_client_write = time.monotonic()
+
+        def write_reasoning_chunk(text: str) -> None:
+            nonlocal client_output_emitted, thinking_streamed, last_client_write
+            if not text:
+                return
+            self._write_openai_chunk(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.response_model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": None}],
+                }
+            )
+            client_output_emitted = True
+            thinking_streamed = True
+            last_client_write = time.monotonic()
+
+        def write_tool_call(call: ToolCall) -> None:
+            nonlocal client_output_emitted, tool_call_index, last_client_write
+            self._write_openai_chunk(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.response_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": tool_call_index,
+                                        "id": call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call.name,
+                                            "arguments": compact_json(call.arguments),
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+            tool_call_index += 1
+            client_output_emitted = True
+            last_client_write = time.monotonic()
+
+        def write_stream_actions(actions: list[tuple[str, Any]]) -> None:
+            for action, value in actions:
+                if action == "text":
+                    write_content_chunk(str(value))
+                elif action == "tool_call" and isinstance(value, ToolCall):
+                    write_tool_call(value)
 
         try:
             self.send_response(200)
@@ -12410,39 +13153,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 stream_budget.observe_delta(delta)
                 if phase.lower() == "thinking":
                     thinking_parts.append(delta)
-                    if request.options.include_thinking and not buffer_for_tools:
-                        self._write_openai_chunk(
-                            {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": request.response_model,
-                                "choices": [
-                                    {"index": 0, "delta": {"reasoning_content": delta}, "finish_reason": None}
-                                ],
-                            }
-                        )
-                        last_client_write = time.monotonic()
+                    # Thinking is forwarded like any other upstream delta.
+                    # Once it reaches the client, a malformed tool block is
+                    # reported instead of silently replayed; the replay window
+                    # is limited to attempts that sent no client bytes at all.
+                    if request.options.include_thinking:
+                        write_reasoning_chunk(delta)
                     else:
                         keepalive_if_due()
                     continue
                 text_parts.append(delta)
-                if not buffer_for_tools:
-                    self._write_openai_chunk(
-                        {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": request.response_model,
-                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                        }
-                    )
-                    last_client_write = time.monotonic()
+                if tool_stream is None:
+                    write_content_chunk(delta)
                 else:
+                    write_stream_actions(tool_stream.feed(delta))
                     keepalive_if_due()
+            if tool_stream is not None:
+                write_stream_actions(tool_stream.finish())
+
             def release_initial_output() -> None:
+                nonlocal tool_stream
                 text_parts.clear()
                 thinking_parts.clear()
+                if tools_active:
+                    tool_stream = RealtimeToolCallStream(
+                        request.tools,
+                        request.tool_choice,
+                        id_prefix=tool_call_id_prefix(request.surface),
+                    )
 
             def _regenerate_required_turn(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
                 events2, context2, state2 = self._start_protocol_completion(
@@ -12461,52 +13199,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "".join(thinking_parts),
                 _regenerate_required_turn,
                 release_initial_output,
+                allow_retry=not client_output_emitted,
             )
             text_parts.clear()
             thinking_parts.clear()
             self._release_chat_slot_early()
-            if buffer_for_tools and request.options.include_thinking and turn.thinking:
-                self._write_openai_chunk(
-                    {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": request.response_model,
-                        "choices": [
-                            {"index": 0, "delta": {"reasoning_content": turn.thinking}, "finish_reason": None}
-                        ],
-                    }
+            if tool_stream is not None and tool_stream.malformed:
+                log_event(
+                    "tool_stream_malformed_block_suppressed",
+                    level=logging.WARNING,
+                    surface=request.surface,
+                    model=request.options.model,
                 )
-            if buffer_for_tools and turn.text:
-                self._write_openai_chunk(
-                    {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": request.response_model,
-                        "choices": [{"index": 0, "delta": {"content": turn.text}, "finish_reason": None}],
-                    }
-                )
-            if turn.tool_calls:
-                tool_deltas = []
-                for index, call in enumerate(turn.tool_calls):
-                    tool_deltas.append(
-                        {
-                            "index": index,
-                            "id": call.id,
-                            "type": "function",
-                            "function": {"name": call.name, "arguments": compact_json(call.arguments)},
-                        }
-                    )
-                self._write_openai_chunk(
-                    {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": request.response_model,
-                        "choices": [{"index": 0, "delta": {"tool_calls": tool_deltas}, "finish_reason": None}],
-                    }
-                )
+            if (
+                tools_active
+                and request.options.include_thinking
+                and turn.thinking
+                and not thinking_streamed
+            ):
+                write_reasoning_chunk(turn.thinking)
+            # Prose was already released by the real-time filter. Fall back
+            # only for formats the filter deliberately does not scan (for
+            # example a bare JSON wrapper), so no content is lost.
+            if tools_active and turn.text and not text_streamed:
+                write_content_chunk(turn.text)
+            if turn.tool_calls and tool_call_index < len(turn.tool_calls):
+                for call in turn.tool_calls[tool_call_index:]:
+                    write_tool_call(call)
             self._write_openai_chunk(
                 {
                     "id": completion_id,
@@ -12517,7 +13236,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         {
                             "index": 0,
                             "delta": {},
-                            "finish_reason": "tool_calls" if turn.tool_calls else "stop",
+                            "finish_reason": "tool_calls" if (turn.tool_calls or tool_call_index) else "stop",
                         }
                     ],
                     "usage": openai_usage(turn),
@@ -12598,11 +13317,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
         context: dict[str, Any] = {}
         state = self._active_state()
         buffer_for_tools = bool(request.tools) and request.tool_choice.mode != "none"
+        tool_stream = (
+            RealtimeToolCallStream(
+                request.tools,
+                request.tool_choice,
+                id_prefix=tool_call_id_prefix(request.surface),
+            )
+            if buffer_for_tools
+            else None
+        )
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        streamed_text_parts: list[str] = []
         stream_budget = UpstreamStreamBudget()
         sequence = 0
         message_id = "msg_" + uuid.uuid4().hex
+        message_started = False
+        text_streamed = False
+        reasoning_streamed = False
         # Thinking is streamed as a standard `reasoning` output item (index 0),
         # so the assistant message and any tool items start at index 1.
         reasoning_wanted = bool(request.options.include_thinking) and bool(request.options.enable_thinking)
@@ -12625,6 +13357,71 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if now - last_client_write >= SSE_KEEPALIVE_INTERVAL_SECONDS:
                 self._sse_keepalive()
                 last_client_write = now
+
+        def send_reasoning_delta(text: str) -> None:
+            nonlocal reasoning_streamed
+            if not text or not reasoning_wanted:
+                return
+            send(
+                "response.reasoning_summary_text.delta",
+                {
+                    "item_id": reasoning_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": text,
+                },
+            )
+            reasoning_streamed = True
+
+        def ensure_message_item() -> None:
+            nonlocal message_started
+            if message_started:
+                return
+            send(
+                "response.output_item.added",
+                {
+                    "output_index": output_offset,
+                    "item": {
+                        "id": message_id,
+                        "type": "message",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                },
+            )
+            send(
+                "response.content_part.added",
+                {
+                    "item_id": message_id,
+                    "output_index": output_offset,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                },
+            )
+            message_started = True
+
+        def send_text_delta(text: str) -> None:
+            nonlocal text_streamed
+            if not text:
+                return
+            ensure_message_item()
+            send(
+                "response.output_text.delta",
+                {
+                    "item_id": message_id,
+                    "output_index": output_offset,
+                    "content_index": 0,
+                    "delta": text,
+                },
+            )
+            streamed_text_parts.append(text)
+            text_streamed = True
+
+        def send_stream_actions(actions: list[tuple[str, Any]]) -> None:
+            for action, value in actions:
+                if action == "text":
+                    send_text_delta(str(value))
 
         try:
             self.send_response(200)
@@ -12661,29 +13458,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "part": {"type": "summary_text", "text": ""},
                     },
                 )
-            if not buffer_for_tools:
-                send(
-                    "response.output_item.added",
-                    {
-                        "output_index": output_offset,
-                        "item": {
-                            "id": message_id,
-                            "type": "message",
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": [],
-                        },
-                    },
-                )
-                send(
-                    "response.content_part.added",
-                    {
-                        "item_id": message_id,
-                        "output_index": output_offset,
-                        "content_index": 0,
-                        "part": {"type": "output_text", "text": "", "annotations": []},
-                    },
-                )
             events, context, state = self._start_protocol_completion(request)
             for event in events:
                 stream_budget.observe_event(event)
@@ -12701,35 +13475,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 stream_budget.observe_delta(delta)
                 if phase.lower() == "thinking":
                     thinking_parts.append(delta)
-                    if reasoning_wanted and not buffer_for_tools:
-                        send(
-                            "response.reasoning_summary_text.delta",
-                            {
-                                "item_id": reasoning_id,
-                                "output_index": 0,
-                                "content_index": 0,
-                                "delta": delta,
-                            },
-                        )
+                    if reasoning_wanted:
+                        send_reasoning_delta(delta)
                     else:
                         keepalive_if_due()
                     continue
                 text_parts.append(delta)
-                if not buffer_for_tools:
-                    send(
-                        "response.output_text.delta",
-                        {
-                            "item_id": message_id,
-                            "output_index": output_offset,
-                            "content_index": 0,
-                            "delta": delta,
-                        },
-                    )
+                if tool_stream is None:
+                    send_text_delta(delta)
                 else:
+                    send_stream_actions(tool_stream.feed(delta))
                     keepalive_if_due()
+            if tool_stream is not None:
+                send_stream_actions(tool_stream.finish())
+
             def release_initial_output() -> None:
+                nonlocal tool_stream, reasoning_streamed
                 text_parts.clear()
                 thinking_parts.clear()
+                reasoning_streamed = False
+                if buffer_for_tools:
+                    tool_stream = RealtimeToolCallStream(
+                        request.tools,
+                        request.tool_choice,
+                        id_prefix=tool_call_id_prefix(request.surface),
+                    )
 
             def _regenerate_required_turn(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
                 events2, context2, state2 = self._start_protocol_completion(
@@ -12748,21 +13518,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "".join(thinking_parts),
                 _regenerate_required_turn,
                 release_initial_output,
+                allow_retry=not (text_streamed or reasoning_streamed),
             )
             text_parts.clear()
             thinking_parts.clear()
             self._release_chat_slot_early()
             if reasoning_wanted:
-                if buffer_for_tools and turn.thinking:
-                    send(
-                        "response.reasoning_summary_text.delta",
-                        {
-                            "item_id": reasoning_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": turn.thinking,
-                        },
-                    )
+                if buffer_for_tools and turn.thinking and not reasoning_streamed:
+                    send_reasoning_delta(turn.thinking)
                 send(
                     "response.reasoning_summary_text.done",
                     {
@@ -12785,85 +13548,145 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "response.output_item.done",
                     {"output_index": 0, "item": build_reasoning_output_item(reasoning_id, turn.thinking)},
                 )
+            # The message item's done payload must match the concatenated
+            # deltas exactly; turn.text may have had surrounding whitespace
+            # trimmed by the semantic parser.
+            message_text = "".join(streamed_text_parts)
             if buffer_for_tools:
-                output = build_responses_output(turn, include_reasoning=reasoning_wanted)
-                if reasoning_wanted and output and output[0]["type"] == "reasoning":
-                    # Keep the streamed reasoning item id stable in the final payload.
-                    output = [build_reasoning_output_item(reasoning_id, turn.thinking)] + output[1:]
-                # The reasoning item was already announced incrementally at
-                # output index 0, so only the message/tool items are replayed.
-                for output_index, item in enumerate(output[1:] if reasoning_wanted else output, start=output_offset):
-                    send("response.output_item.added", {"output_index": output_index, "item": item})
-                    if item["type"] == "message":
-                        item_id = str(item["id"])
-                        text = str(item["content"][0].get("text") or "")
-                        send(
-                            "response.content_part.added",
-                            {
-                                "item_id": item_id,
-                                "output_index": output_index,
-                                "content_index": 0,
-                                "part": {"type": "output_text", "text": "", "annotations": []},
+                # Prose and tool markup were already separated in real time.
+                # Finish the streamed message item, then emit one validated
+                # function_call item per tool call.
+                if message_started:
+                    send(
+                        "response.output_text.done",
+                        {
+                            "item_id": message_id,
+                            "output_index": output_offset,
+                            "content_index": 0,
+                            "text": message_text,
+                        },
+                    )
+                    send(
+                        "response.content_part.done",
+                        {
+                            "item_id": message_id,
+                            "output_index": output_offset,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": message_text, "annotations": []},
+                        },
+                    )
+                    send(
+                        "response.output_item.done",
+                        {
+                            "output_index": output_offset,
+                            "item": {
+                                "id": message_id,
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": message_text, "annotations": []}],
                             },
-                        )
-                        if text:
-                            send(
-                                "response.output_text.delta",
-                                {
-                                    "item_id": item_id,
-                                    "output_index": output_index,
-                                    "content_index": 0,
-                                    "delta": text,
-                                },
-                            )
-                        send(
-                            "response.output_text.done",
-                            {
-                                "item_id": item_id,
-                                "output_index": output_index,
-                                "content_index": 0,
-                                "text": text,
-                            },
-                        )
-                        send(
-                            "response.content_part.done",
-                            {
-                                "item_id": item_id,
-                                "output_index": output_index,
-                                "content_index": 0,
-                                "part": item["content"][0],
-                            },
-                        )
+                        },
+                    )
+                elif turn.text or not turn.tool_calls:
+                    # Fallback for a format the real-time filter did not scan,
+                    # plus the empty-answer case (keep an empty message item
+                    # consistent with the non-tool stream).
+                    if turn.text:
+                        send_text_delta(turn.text)
+                        message_text = "".join(streamed_text_parts)
                     else:
-                        arguments = str(item.get("arguments") or "{}")
-                        send(
-                            "response.function_call_arguments.delta",
-                            {"item_id": item["id"], "output_index": output_index, "delta": arguments},
-                        )
-                        send(
-                            "response.function_call_arguments.done",
-                            {
-                                "item_id": item["id"],
-                                "output_index": output_index,
-                                "name": item["name"],
-                                "arguments": arguments,
+                        ensure_message_item()
+                    send(
+                        "response.output_text.done",
+                        {
+                            "item_id": message_id,
+                            "output_index": output_offset,
+                            "content_index": 0,
+                            "text": message_text,
+                        },
+                    )
+                    send(
+                        "response.content_part.done",
+                        {
+                            "item_id": message_id,
+                            "output_index": output_offset,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": message_text, "annotations": []},
+                        },
+                    )
+                    send(
+                        "response.output_item.done",
+                        {
+                            "output_index": output_offset,
+                            "item": {
+                                "id": message_id,
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": message_text, "annotations": []}],
                             },
-                        )
-                    send("response.output_item.done", {"output_index": output_index, "item": item})
+                        },
+                    )
+                output = []
+                if reasoning_wanted:
+                    output.append(build_reasoning_output_item(reasoning_id, turn.thinking))
+                if message_started or turn.text or not turn.tool_calls:
+                    output.append(
+                        {
+                            "id": message_id,
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": message_text, "annotations": []}],
+                        }
+                    )
+                tool_output_index = output_offset + (1 if message_started else 0)
+                for call in turn.tool_calls:
+                    item = {
+                        "id": "fc_" + uuid.uuid4().hex[:24],
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call.id,
+                        "name": call.name,
+                        "arguments": compact_json(call.arguments),
+                    }
+                    send("response.output_item.added", {"output_index": tool_output_index, "item": item})
+                    send(
+                        "response.function_call_arguments.delta",
+                        {
+                            "item_id": item["id"],
+                            "output_index": tool_output_index,
+                            "delta": item["arguments"],
+                        },
+                    )
+                    send(
+                        "response.function_call_arguments.done",
+                        {
+                            "item_id": item["id"],
+                            "output_index": tool_output_index,
+                            "name": item["name"],
+                            "arguments": item["arguments"],
+                        },
+                    )
+                    send("response.output_item.done", {"output_index": tool_output_index, "item": item})
+                    output.append(item)
+                    tool_output_index += 1
             else:
+                ensure_message_item()
                 message_output = {
                     "id": message_id,
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": turn.text, "annotations": []}],
+                    "content": [{"type": "output_text", "text": message_text, "annotations": []}],
                 }
                 output = [message_output]
                 if reasoning_wanted:
                     output.insert(0, build_reasoning_output_item(reasoning_id, turn.thinking))
                 send(
                     "response.output_text.done",
-                    {"item_id": message_id, "output_index": output_offset, "content_index": 0, "text": turn.text},
+                    {"item_id": message_id, "output_index": output_offset, "content_index": 0, "text": message_text},
                 )
                 send(
                     "response.content_part.done",
@@ -14404,7 +15227,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._browser_progress_update(
                 running=True,
                 mode="login",
-                stage="正在启动授权浏览器…",
+                stage="正在启动授权浏览器，请在弹出窗口中手动完成登录和拼图验证码…",
                 updated_at=now,
                 error="",
             )
@@ -14445,7 +15268,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     **self._profile_persistence_result(
                         persisted,
                         persistence_error=persistence_error,
-                        success_message="浏览器登录态已采集、保存并切换为当前账号；验证码将在发送消息时由本地求解器自动获取。",
+                        success_message="浏览器登录态已采集、保存并切换为当前账号；登录时的拼图验证码已在弹出窗口中手动完成。",
                         failure_message="浏览器登录态已采集并切换，但仅在当前进程生效；本地加密存储写入失败，重启后可能丢失。",
                     ),
                     "profile": profile_summary(profile, active=True),
@@ -14470,11 +15293,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 self.browser_flow_lock.release()
 
-    def _handle_auth_captcha_refresh(self) -> None:
+    def _handle_auth_captcha_refresh(self, *, manual: bool = False) -> None:
         flow_acquired = False
         try:
             body = self._read_json_body()
-            if not browser_captcha_refresh_enabled(self.fresh_captcha_browser):
+            if not manual and not browser_captcha_refresh_enabled(self.fresh_captcha_browser):
                 self._json_response(
                     409,
                     {
@@ -14496,12 +15319,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "ok": False,
                         "error": {
                             "code": "browser_automation_unavailable",
-                            "message": "旧版浏览器验证码组件未安装；请改用 fresh-captcha 本地求解器。",
+                            "message": (
+                                "浏览器验证码组件未安装；请先安装 requirements.txt，"
+                                "或使用 Token/HAR 登录。"
+                            ),
                         },
                     },
                 )
                 return
-            timeout_sec = int(body.get("timeout_sec") or 120)
+            default_timeout = 300 if manual else 120
+            timeout_sec = int(body.get("timeout_sec") or default_timeout)
             timeout_ms = max(30, min(timeout_sec, 300)) * 1000
             if not self.browser_flow_lock.acquire(blocking=False):
                 self._auth_flow_busy_response()
@@ -14511,7 +15338,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._browser_progress_update(
                 running=True,
                 mode="captcha",
-                stage="正在打开验证码采集窗口…",
+                stage=(
+                    "正在打开手动验证码窗口，请在浏览器中完成拼图…"
+                    if manual
+                    else "正在打开验证码采集窗口…"
+                ),
                 updated_at=now,
                 error="",
             )
@@ -14527,6 +15358,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 chrome_path=self.chrome_path,
                 headless=False,
                 timeout_ms=timeout_ms,
+                manual=manual,
             )
             if not captcha:
                 raise RuntimeError("验证码采集为空，请重试。")
@@ -14534,9 +15366,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 profile.state.captcha_verify_param = captcha
                 if profile_id == self.active_profile_id:
                     self.__class__.state = profile.state
+                _record_manual_captcha(profile.state)
                 persisted, persistence_error = self._save_profile_store()
+            if manual and persisted:
+                saved_stage = "手动验证码已保存（90 秒内有效）"
+            elif manual:
+                saved_stage = "手动验证码已更新（本地保存失败）"
+            elif persisted:
+                saved_stage = "验证码已保存"
+            else:
+                saved_stage = "验证码已更新（本地保存失败）"
             self._browser_progress_update(
-                stage="验证码已保存" if persisted else "验证码已更新（本地保存失败）",
+                stage=saved_stage,
                 error="" if persisted else persistence_error,
             )
             self._json_response(
@@ -14546,18 +15387,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     **self._profile_persistence_result(
                         persisted,
                         persistence_error=persistence_error,
-                        success_message="验证码已采集并保存到当前账号",
+                        success_message=(
+                            "手动验证码已保存到当前账号，请在 90 秒内发送消息"
+                            if manual
+                            else "验证码已采集并保存到当前账号"
+                        ),
                         failure_message="验证码已更新到当前进程，但本地加密存储写入失败，重启后可能丢失。",
                     ),
                     "profile": profile_summary(profile, active=profile_id == self.active_profile_id),
                     "captcha_ok": True,
+                    **(
+                        {"manual_captcha_expires_in": int(MANUAL_CAPTCHA_TTL_SECONDS)}
+                        if manual
+                        else {}
+                    ),
                 },
             )
         except (BrokenPipeError, ConnectionResetError):
             raise
         except Exception as exc:
             if flow_acquired:
-                self._browser_progress_update(stage="验证码采集失败", error=str(exc))
+                self._browser_progress_update(
+                    stage="手动验证码采集失败" if manual else "验证码采集失败",
+                    error=str(exc),
+                )
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
         finally:
             if flow_acquired:
@@ -14895,7 +15748,7 @@ def write_evidence(har: dict[str, Any], out_dir: Path) -> None:
         req = entry.get("request", {})
         resp = entry.get("response", {})
         sp = urlsplit(req.get("url", ""))
-        if sp.netloc != "chat.z.ai":
+        if sp.netloc != "zchat.z.ai":
             continue
         post = request_json(entry)
         response = response_json(entry)
@@ -14964,7 +15817,7 @@ def write_evidence(har: dict[str, Any], out_dir: Path) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--har", default="chat.z.ai.har", help="HAR path, default: chat.z.ai.har")
+    parser.add_argument("--har", default="zchat.z.ai.har", help="HAR path, default: zchat.z.ai.har")
     parser.add_argument("--extract-state-json", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--prompt", help="Send one prompt directly to the selected upstream model")
     parser.add_argument("--serve", action="store_true", help="Serve local OpenAI-compatible proxy")
@@ -15057,6 +15910,11 @@ def main() -> int:
     setup_logging(args.log_level)
     LOG.info("glm2api starting: serve=%s port=%s log_level=%s", args.serve, args.port, args.log_level)
     har_path = Path(args.har)
+    if har_path.name == "zchat.z.ai.har" and not har_path.exists():
+        # Users upgrading from the old domain keep their existing capture.
+        legacy_har = har_path.with_name("chat.z.ai.har")
+        if legacy_har.exists():
+            har_path = legacy_har
     if args.extract_state_json:
         if not har_path.exists():
             raise FileNotFoundError(f"HAR 不存在: {har_path}")

@@ -467,15 +467,19 @@ class WebAndCompatibilityCases:
         self.assertEqual(0.75, app.HISTORY_PROGRESS_INTERVAL_SECONDS)
         self.assertIn("这里每 750ms 重取一次", html)
 
-    def test_web_uses_automatic_captcha_solver_without_manual_capture_controls(self) -> None:
+    def test_web_uses_automatic_captcha_solver_with_manual_account_fallback(self) -> None:
         html = web_source()
         self.assertNotIn('id="btn-captcha-refresh"', html)
-        self.assertNotIn('data-profile-action="captcha"', html)
+        self.assertIn('data-profile-action="captcha"', html)
+        self.assertIn("requestManualCaptcha", html)
+        self.assertIn("手动验证码", html)
+        self.assertIn("manual_captcha_expires_in", html)
         self.assertNotIn("手动采集验证码", html)
         self.assertNotIn("验证码采集窗口", html)
         self.assertIn("function formatCaptchaMode(data)", html)
         self.assertIn("自动 · happy-dom / 浏览器回退", html)
-        self.assertIn("验证码按服务端模式自动处理", html)
+        self.assertIn("发送消息用的验证码默认自动处理", html)
+        self.assertIn("登录时的拼图验证码", html)
         self.assertIn("data.playwright_available !== false", html)
         self.assertIn("浏览器登录组件未安装", html)
         self.assertNotIn("data.user_id ||", html)
@@ -495,15 +499,24 @@ class WebAndCompatibilityCases:
         self.assertFalse(disabled.fresh_captcha)
         self.assertFalse(hasattr(current, "fresh_captcha_browser"))
 
-    def test_start_script_prefers_happydom_without_playwright_dependency(self) -> None:
+    def test_start_script_uses_on_demand_captcha_and_keeps_happydom_support(self) -> None:
         script = (PROJECT_ROOT / "start_glm2api.ps1").read_text(encoding="utf-8")
         self.assertIn("if (Ensure-HappyDom)", script)
         self.assertIn("captcha solver: happy-dom (no browser worker required)", script)
-        self.assertIn("'--fresh-captcha', '--captcha-mode', $CaptchaMode", script)
+        self.assertIn("'--captcha-mode', $CaptchaMode", script)
+        self.assertNotIn("'--fresh-captcha'", script)
         self.assertNotIn("'--fresh-captcha-browser', '--open-web'", script)
         self.assertIn("scripts\\startup_helpers.ps1", script)
         self.assertNotIn("& $node.Source -e", script)
         self.assertIn("scripts\\check_happydom.mjs", script)
+
+    def test_refresh_state_browser_version_updates_live_fe_and_region(self) -> None:
+        state = fake_state()
+        state.fe_version = "prod-fe-1.1.92"
+        state.region = "overseas"
+        app.refresh_state_browser_version(state)
+        self.assertEqual("prod-fe-1.1.107", state.fe_version)
+        self.assertEqual("cn", state.region)
 
     def test_windows_powershell_native_probe_returns_exit_code_without_terminating(self) -> None:
         if sys.platform != "win32":

@@ -20,6 +20,7 @@
       apiKeySource: "store",
       playwrightAvailable: true,
       browserLoginBusy: false,
+      manualCaptchaBusy: false,
       lastStatus: null,
       profiles: [],
       maxProfiles: 0,

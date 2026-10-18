@@ -19,13 +19,19 @@ function Find-Python {
 }
 
 function Find-Har {
-    $localHar = Join-Path -Path $Root -ChildPath 'chat.z.ai.har'
+    $localHar = Join-Path -Path $Root -ChildPath 'zchat.z.ai.har'
+    if (-not (Test-Path -LiteralPath $localHar)) {
+        $localHar = Join-Path -Path $Root -ChildPath 'chat.z.ai.har'
+    }
     if (Test-Path -LiteralPath $localHar) {
         return $localHar
     }
 
     $parent = Split-Path -Parent $Root
-    $parentHar = Join-Path -Path $parent -ChildPath 'chat.z.ai.har'
+    $parentHar = Join-Path -Path $parent -ChildPath 'zchat.z.ai.har'
+    if (-not (Test-Path -LiteralPath $parentHar)) {
+        $parentHar = Join-Path -Path $parent -ChildPath 'chat.z.ai.har'
+    }
     if (Test-Path -LiteralPath $parentHar) {
         return $parentHar
     }
@@ -40,14 +46,16 @@ function Ensure-Playwright {
 
     $probeExit = Invoke-NativeCommand -FilePath $PythonExe -ArgumentList @('-c', 'import playwright') -Quiet
     if ($probeExit -eq 0) {
-        return
+        return $true
     }
 
     Write-Host '[glm2api] playwright was not found; installing requirements...' -ForegroundColor Yellow
     $installExit = Invoke-NativeCommand -FilePath $PythonExe -ArgumentList @('-m', 'pip', 'install', '-r', 'requirements.txt')
     if ($installExit -ne 0) {
-        throw 'Failed to install playwright. Try manually: python -m pip install -r requirements.txt'
+        Write-Host '[glm2api] Playwright install failed; Browser Login will be disabled. Token/HAR still work.' -ForegroundColor Yellow
+        return $false
     }
+    return $true
 }
 
 function Test-HappyDom {
@@ -130,8 +138,13 @@ if (Ensure-HappyDom) {
     Write-Host '[glm2api] captcha solver: happy-dom (no browser worker required).' -ForegroundColor Green
 } else {
     Write-Host '[glm2api] happy-dom is unavailable; enabling the Playwright browser fallback.' -ForegroundColor Yellow
-    Ensure-Playwright -PythonExe $PythonExe
     $CaptchaMode = 'browser'
+}
+# Browser login opens a visible Playwright window for the manual puzzle
+# captcha, so keep it available even when happy-dom solves message captchas.
+$BrowserLoginReady = Ensure-Playwright -PythonExe $PythonExe
+if (-not $BrowserLoginReady) {
+    Write-Host '[glm2api] Browser Login is unavailable; use Token/HAR in the web panel.' -ForegroundColor Yellow
 }
 
 Write-Host ''
@@ -142,10 +155,13 @@ if ($HarPath) {
     Write-Host '[glm2api] no HAR found; starting without account. Add Token/HAR in the web panel.' -ForegroundColor Yellow
 }
 Write-Host '[glm2api] Web: http://127.0.0.1:8008/'
-Write-Host '[glm2api] Login: Token/HAR are browser-free; Browser Login uses optional Playwright.'
+Write-Host '[glm2api] Login: Token/HAR are browser-free; Browser Login opens a visible window for manual puzzle captcha.'
 Write-Host ''
 
-$RunArgs = @('.\glm2api.py', '--serve', '--port', '8008', '--fresh-captcha', '--captcha-mode', $CaptchaMode, '--open-web')
+# On-demand captcha: use the account's stored/manual captcha and only ask for
+# a fresh one in the account UI when the upstream actually demands it.
+# `--fresh-captcha` remains an opt-in CLI mode for accounts that need it.
+$RunArgs = @('.\glm2api.py', '--serve', '--port', '8008', '--captcha-mode', $CaptchaMode, '--open-web')
 if ($HarPath) {
     $RunArgs += @('--har', $HarPath)
 }
