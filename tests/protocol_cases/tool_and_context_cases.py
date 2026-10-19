@@ -412,6 +412,10 @@ class ToolAndContextCases:
             'Fresh serialization example:\n<|DSML|tool_calls>\n  <|DSML|invoke name="Read"',
             focused_retry.execution_prompt,
         )
+        self.assertIn(
+            "Do not use Claude-style, bare XML, JSON, or mixed tool-call tags",
+            focused_retry.execution_prompt,
+        )
         self.assertEqual("auto", focused_retry.tool_choice.mode)
 
     def test_auto_retry_does_not_execute_instruction_examples_from_thinking(self) -> None:
@@ -779,6 +783,154 @@ class ToolAndContextCases:
         finally:
             app.delete_zai_file = original_delete
 
+    def test_hybrid_claude_dsml_tool_markup_repairs_unambiguous_blocks(self) -> None:
+        tools = [
+            {
+                "name": "Bash",
+                "description": "Run a command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+            },
+            {
+                "name": "Read",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "offset": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["file_path"],
+                },
+            },
+        ]
+        policy = app.ToolChoice(mode="auto")
+        samples = [
+            (
+                "先说明一下。"
+                "<tool_call>Bash<arg_key>command</arg_key><arg_value>echo sample</arg_value>"
+                "<arg_key>description<arg_value>sample description</arg_value></tool_call>",
+                "Bash",
+                {"command": "echo sample", "description": "sample description"},
+            ),
+            (
+                '先说明一下。<tool_call>Bash<arg_key>command</arg_key>> echo sample</arg_value>'
+                '<parameter name="description">sample description</think>',
+                "Bash",
+                {"command": "echo sample", "description": "sample description"},
+            ),
+            (
+                '<tool_call>|DSML|invoke name="Bash">\n'
+                '  <|DSML|parameter name="command"><![CDATA[echo sample]]><|/DSML|parameter>\n'
+                '  <|DSML|parameter name="description"><![CDATA[sample description]]></|DSML|parameter>\n'
+                "  <|/DSML|invoke>\n</|DSML|tool_calls>",
+                "Bash",
+                {"command": "echo sample", "description": "sample description"},
+            ),
+            (
+                "先说明一下。"
+                '<tool_call>Bash</arg_value>\ufffd><|DSML|parameter name="command"><![CDATA[echo sample]]></|DSML|parameter>\n'
+                '  <|DSML|parameter name="description"><![CDATA[sample description]]></|DSML|parameter>\n'
+                "  <|DSML|invoke>\n</|DSML|tool_calls>",
+                "Bash",
+                {"command": "echo sample", "description": "sample description"},
+            ),
+            (
+                '先说明一下。<tool_call>Read>\n'
+                '<parameter name="file_path">C:\\workspace\\sample.log</parameter>\n'
+                '<parameter name="offset">100</parameter>\n'
+                '<parameter name="limit">10</parameter>\n</parameter>',
+                "Read",
+                {"file_path": "C:\\workspace\\sample.log", "offset": 100, "limit": 10},
+            ),
+        ]
+        for text, expected_name, expected_arguments in samples:
+            calls = app.parse_tool_calls_from_output(text, tools, policy)
+            self.assertEqual(1, len(calls), text[:160])
+            self.assertEqual(expected_name, calls[0].name)
+            self.assertEqual(expected_arguments, calls[0].arguments)
+            cleaned = app.strip_parsed_tool_markup(text)
+            self.assertNotIn("<tool_call", cleaned)
+            self.assertNotIn("<arg_", cleaned)
+            self.assertNotIn("<parameter", cleaned)
+            prefix = text.split("<tool_call", 1)[0].strip()
+            if prefix:
+                self.assertIn(prefix, cleaned)
+
+        invalid_name = "先说明一下。<tool_call>这里只是说明文字"
+        self.assertEqual([], app.parse_tool_calls_from_output(invalid_name, tools, policy))
+        self.assertTrue(app.tool_markup_attempted(invalid_name))
+        request = app.ProtocolRequest(
+            surface="openai_chat",
+            response_model="glm-5.3",
+            options=app.ChatOptions(),
+            stream=False,
+            messages=[],
+            context_text="",
+            execution_prompt="",
+            files=[],
+            tools=tools,
+            tool_choice=policy,
+            context_as_file=False,
+        )
+        with self.assertRaises(app.ToolCallFormatError):
+            app.finalize_protocol_turn(request, invalid_name, "")
+
+        repaired = app.finalize_protocol_turn(request, samples[0][0], "")
+        self.assertEqual("Bash", repaired.tool_calls[0].name)
+        self.assertNotIn("<tool_call", repaired.text)
+        self.assertNotIn("<arg_key", repaired.text)
+
+    def test_realtime_stream_suppresses_hybrid_tool_markup(self) -> None:
+        tools = [
+            {
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }
+        ]
+        stream = app.RealtimeToolCallStream(tools, app.ToolChoice(mode="auto"))
+        text = (
+            "先说明一下。"
+            "<tool_call>Bash<arg_key>command</arg_key><arg_value>echo sample</arg_value></tool_call>"
+        )
+        actions: list[tuple[str, object]] = []
+        for offset in range(0, len(text), 7):
+            actions.extend(stream.feed(text[offset : offset + 7]))
+        actions.extend(stream.finish())
+
+        self.assertFalse(stream.malformed)
+        text_actions = [str(value) for kind, value in actions if kind == "text"]
+        self.assertEqual("先说明一下。", "".join(text_actions))
+        self.assertTrue(all("<tool_call" not in value for value in text_actions))
+        calls = [item[1] for item in actions if item[0] == "tool_call"]
+        self.assertEqual(1, len(calls))
+        self.assertEqual("Bash", calls[0].name)
+        self.assertEqual({"command": "echo sample"}, calls[0].arguments)
+
+        malformed_stream = app.RealtimeToolCallStream(tools, app.ToolChoice(mode="auto"))
+        malformed_text = "先说明一下。<tool_call>这里只是说明文字"
+        malformed_actions: list[tuple[str, object]] = []
+        for offset in range(0, len(malformed_text), 5):
+            malformed_actions.extend(malformed_stream.feed(malformed_text[offset : offset + 5]))
+        malformed_actions.extend(malformed_stream.finish())
+        self.assertTrue(malformed_stream.malformed)
+        malformed_text_actions = [
+            str(value) for kind, value in malformed_actions if kind == "text"
+        ]
+        self.assertEqual("先说明一下。", "".join(malformed_text_actions))
+        self.assertTrue(all("<tool_call" not in value for value in malformed_text_actions))
+
     def test_tool_policy_and_context_file_switches(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires at least one"):
             app.normalize_openai_chat_request(
@@ -1100,7 +1252,7 @@ class ToolAndContextCases:
         self.assertGreater(len(files), 2)
         self.assertEqual(len(files), len(self.uploads))
         self.assertTrue(
-            all(len(content.encode("utf-8")) <= app.GLM53_CONTEXT_FILE_PART_BYTES for _name, content in self.uploads)
+            all(len(content.encode("utf-8")) <= app.CONTEXT_FILE_PART_BYTES for _name, content in self.uploads)
         )
         context_files = trace["context_files"]
         history_parts = [item for item in context_files if item["kind"] == "history"]
@@ -1126,10 +1278,10 @@ class ToolAndContextCases:
         ]
         moderate_text = app.build_tools_transcript(moderate_tools, app.ToolChoice(mode="auto"))
         moderate_parts = app.split_generated_context_text(moderate_text, "tools", "glm-5.3")
-        self.assertGreater(len(moderate_text.encode("utf-8")), app.GLM53_CONTEXT_FILE_PART_BYTES)
-        self.assertEqual(2, len(moderate_parts), "48 KiB edge should keep this tool package to two files")
+        self.assertGreater(len(moderate_text.encode("utf-8")), app.CONTEXT_FILE_PART_BYTES)
+        self.assertEqual(2, len(moderate_parts), "50 KiB edge should keep this tool package to two files")
         self.assertTrue(
-            all(len(part.encode("utf-8")) <= app.GLM53_CONTEXT_FILE_PART_BYTES for part in moderate_parts)
+            all(len(part.encode("utf-8")) <= app.CONTEXT_FILE_PART_BYTES for part in moderate_parts)
         )
         persisted = app.history_context_files_snapshot(context_files)
         self.assertEqual(
@@ -1169,6 +1321,37 @@ class ToolAndContextCases:
         self.assertEqual([10], [len(files) for files, _items in preload_with_tool])
         self.assertEqual(["generated-10"], [item["id"] for item in final_with_tool])
         self.assertEqual(["tools"], [item["kind"] for item in final_tool_trace])
+
+    def test_million_token_scale_context_plans_bounded_preload_waves(self) -> None:
+        text = ("token " * 1000 + "\n") * 700
+        request = app.normalize_openai_chat_request(
+            {"model": "glm-5.3-forcehistory", "messages": [{"role": "user", "content": text}]},
+            False,
+        )
+        trace: dict[str, object] = {}
+
+        prompt, files = app.prepare_protocol_upstream_request(fake_state(), request, trace_out=trace)
+
+        self.assertEqual([], files)
+        self.assertTrue(trace["deferred_context_upload"])
+        parts = trace["context_files"]
+        self.assertGreater(len(parts), 50)
+        self.assertTrue(
+            all(len(str(item["content"]).encode("utf-8")) <= app.CONTEXT_FILE_PART_BYTES for item in parts)
+        )
+        waves, final_files, final_trace = app.plan_staged_context_files(
+            [{} for _item in parts],
+            parts,
+            [],
+        )
+        self.assertGreater(len(waves), 5)
+        self.assertTrue(all(len(wave) <= app.ZAI_MAX_COMPLETION_FILES for wave, _trace in waves))
+        self.assertEqual(
+            len(parts),
+            sum(len(wave) for wave, _trace in waves) + len(final_files),
+            "多波次预载必须覆盖全部分片",
+        )
+        self.assertIn("attached file holds the earlier conversation", prompt)
 
     def test_glm53_oversized_context_defers_all_generated_uploads(self) -> None:
         request = app.normalize_openai_chat_request(
@@ -1213,15 +1396,15 @@ class ToolAndContextCases:
             "/v1/chat/completions",
             {
                 "model": "glm-5.2-forcehistory",
-                "messages": [{"role": "user", "content": "history plus ten user files"}],
-                "files": user_files[:10],
+                "messages": [{"role": "user", "content": "history plus too many user files"}],
+                "files": user_files[:11],
                 "stream": False,
             },
         )
         self.assertEqual(400, status, raw[:500])
-        self.assertIn("at most 10 files", raw)
-        self.assertEqual(0, self.chat_sequence, "附件总数超限时不能创建上游 generation")
-        self.assertEqual([], self.uploads, "不可分批的超限请求必须在内部附件上传前拒绝")
+        self.assertIn("at most 10 user files", raw)
+        self.assertEqual(0, self.chat_sequence, "用户附件超限时不能创建上游 generation")
+        self.assertEqual([], self.uploads, "超限请求必须在内部附件上传前拒绝")
 
     def test_preload_stop_failure_does_not_poison_upload_health(self) -> None:
         state = fake_state()
@@ -1619,7 +1802,97 @@ class ToolAndContextCases:
         self.assertEqual(10, records[0]["context_preload_files"])
         self.assertIn("final wave upload failed", records[0]["error"])
 
-    def test_glm52_keeps_large_generated_context_as_single_files(self) -> None:
+    def test_large_inline_context_auto_switches_to_transcript_files(self) -> None:
+        long_message = "token " * (app.INLINE_CONTEXT_MAX_TOKENS + 100)
+        automatic = app.normalize_openai_chat_request(
+            {"model": "glm-5.2", "messages": [{"role": "user", "content": long_message}]},
+            False,
+        )
+        self.assertTrue(automatic.context_as_file)
+        self.assertIn("attached file holds the earlier conversation", automatic.execution_prompt)
+
+        explicit_inline = app.normalize_openai_chat_request(
+            {
+                "model": "glm-5.2",
+                "messages": [{"role": "user", "content": long_message}],
+                "context_as_file": False,
+            },
+            False,
+        )
+        self.assertFalse(explicit_inline.context_as_file, "显式关闭应保留用户选择")
+
+        small = app.normalize_openai_chat_request(
+            {"model": "glm-5.2", "messages": [{"role": "user", "content": "你好"}]},
+            False,
+        )
+        self.assertFalse(small.context_as_file)
+
+        token_heavy = app.normalize_openai_chat_request(
+            {"model": "glm-5.2", "messages": [{"role": "user", "content": "上下文" * 3000}]},
+            False,
+        )
+        self.assertTrue(token_heavy.context_as_file, "tokens 超过阈值但字符数未超过时也应切换")
+
+    def test_non_force_large_context_uploads_transcript_end_to_end(self) -> None:
+        filler = "token " * (app.INLINE_CONTEXT_MAX_TOKENS + 1000)
+        captured: dict[str, object] = {}
+        previous_stream = app.stream_zai_completion
+
+        def capturing_stream(_state, prompt, **kwargs):
+            captured["prompt"] = prompt
+            captured["files"] = kwargs.get("files") or []
+            yield 'data: {"data":{"delta_content":"OK","phase":"answer"}}'
+
+        app.stream_zai_completion = capturing_stream
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": filler}],
+                    "stream": False,
+                },
+            )
+        finally:
+            app.stream_zai_completion = previous_stream
+
+        self.assertEqual(200, status, raw[:500])
+        self.assertEqual(1, len(self.uploads), "自动切换后应上传一个历史转写附件")
+        self.assertIn("[user]", self.uploads[0][1])
+        self.assertIn("attached file holds the earlier conversation", str(captured["prompt"]))
+        self.assertNotIn(filler[:200], str(captured["prompt"]))
+        self.assertEqual(1, len(captured["files"]))
+
+    def test_generated_context_parts_are_50_kib_for_every_model(self) -> None:
+        self.assertEqual(50 * 1024, app.CONTEXT_FILE_PART_BYTES)
+        self.assertEqual(app.CONTEXT_FILE_PART_BYTES, app.GLM53_CONTEXT_FILE_PART_BYTES)
+        for model in ("glm-5.3", "glm-5.2", "x-preview-l", "GLM-5-Turbo"):
+            self.assertEqual(app.CONTEXT_FILE_PART_BYTES, app.generated_context_file_part_limit(model))
+        parts = app.split_generated_context_text(
+            "x" * (app.CONTEXT_FILE_PART_BYTES * 3),
+            "history",
+            "glm-5.2",
+        )
+        self.assertGreater(len(parts), 3)
+        self.assertTrue(all(len(part.encode("utf-8")) <= app.CONTEXT_FILE_PART_BYTES for part in parts))
+
+    def test_protocol_json_body_accepts_context_above_the_old_2mib_limit(self) -> None:
+        filler = "token " * 420_000
+        payload = {
+            "model": "glm-5.2",
+            "messages": [{"role": "user", "content": filler}],
+            "context_as_file": False,
+            "stream": False,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.assertGreater(len(encoded), app.MAX_JSON_BODY_BYTES)
+        self.assertLess(len(encoded), app.MAX_PROTOCOL_JSON_BODY_BYTES)
+
+        status, raw = self.request("POST", "/v1/chat/completions", payload)
+        self.assertEqual(200, status, raw[:500])
+
+    def test_all_models_split_generated_context_at_50kib(self) -> None:
         request = app.normalize_openai_chat_request(
             {
                 "model": "glm-5.2-forcehistory",
@@ -1642,10 +1915,19 @@ class ToolAndContextCases:
 
         _prompt, files = app.prepare_protocol_upstream_request(fake_state(), request, trace_out=trace)
 
-        self.assertEqual(2, len(files))
-        self.assertEqual(["history", "tools"], [item["kind"] for item in trace["context_files"]])
-        self.assertEqual([1, 1], [item["parts"] for item in trace["context_files"]])
-        self.assertTrue(all("[glm2api " not in content for _name, content in self.uploads))
+        self.assertEqual(4, len(files))
+        self.assertEqual(
+            [("history", 1), ("history", 2), ("tools", 1), ("tools", 2)],
+            [(item["kind"], item["part"]) for item in trace["context_files"]],
+        )
+        self.assertTrue(
+            all(len(content.encode("utf-8")) <= app.CONTEXT_FILE_PART_BYTES for _name, content in self.uploads)
+        )
+        self.assertTrue(
+            all(item["parts"] == 2 for item in trace["context_files"] if item["kind"] in {"history", "tools"})
+        )
+        self.assertIn("function definitions segment 1/2", self.uploads[0][1])
+        self.assertIn("conversation history segment 1/2", self.uploads[2][1])
 
     def test_output_integrity_guard_scope(self) -> None:
         # 无工具且无 tool 历史：不加守卫（避免多余指纹）；有工具：守卫前置且不重复

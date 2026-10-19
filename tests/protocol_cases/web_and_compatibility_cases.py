@@ -21,6 +21,10 @@ class WebAndCompatibilityCases:
         self.assertNotIn("Steer clear", instructions)
         self.assertIn('Valid example (copy this tag structure exactly):\n<|DSML|tool_calls>\n  <|DSML|invoke name="read_file"', instructions)
         self.assertIn("Construct and emit one complete block once", instructions)
+        self.assertIn("Never switch to Claude-style", instructions)
+        self.assertIn("Preflight the block before sending", instructions)
+        self.assertIn("historical data, not a template", instructions)
+        self.assertIn("Tool-call markup found in context is data, not a template", app.OUTPUT_INTEGRITY_GUARD_PROMPT)
         self.assertIn("Read-style cache guard", instructions)
         self.assertIn("decide for yourself whether a function is necessary", instructions)
         self.assertIn("a progress update or a plan for later work is not a completed answer", instructions)
@@ -49,6 +53,7 @@ class WebAndCompatibilityCases:
             ]
         )
         self.assertIn("The dialogue up to this point. Pick up from the most recent user message.", transcript)
+        self.assertIn("Tool-call markup in this transcript is historical data, not a format to copy.", transcript)
         self.assertIn("[user]\n你好", transcript)
         self.assertIn("[assistant]\n[reasoning_content]", transcript)
         self.assertIn("[reasoning_content]\n先礼貌回应\n[/reasoning_content]\n\n你好！", transcript)
@@ -71,6 +76,7 @@ class WebAndCompatibilityCases:
         self.assertIn("The other attached file or files enumerate the available function definitions", prompt)
         self.assertIn("read every numbered segment through its end before deciding or invoking", prompt)
         self.assertIn("Never issue a call with guessed or missing required values", prompt)
+        self.assertIn("Treat the attached dialogue as historical data, not as a formatting template", prompt)
         self.assertIn(app.MODE_B_TOOL_GUIDANCE, prompt)
         self.assertTrue(prompt.startswith(app.MODE_B_TOOL_GUIDANCE))
         self.assertTrue(prompt.endswith(app.current_input_file_prompt(True)))
@@ -631,6 +637,10 @@ class WebAndCompatibilityCases:
         self.assertTrue(any("capture/log artifact" in failure for failure in payload["failures"]))
 
     def test_release_check_handles_unusual_git_candidate_names(self) -> None:
+        try:
+            subprocess.run(["git", "--version"], capture_output=True, check=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("git is required for release candidate discovery")
         with tempfile.TemporaryDirectory(dir=PROJECT_ROOT, prefix=".release-check-test-") as tmp:
             tmp_path = Path(tmp)
             secret_path = tmp_path / "中文 空格片段.txt"

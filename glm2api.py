@@ -620,7 +620,9 @@ MAX_HAR_UPLOAD_BYTES = 512 * 1024 * 1024
 MAX_CHAT_FILE_UPLOAD_BYTES = 128 * 1024 * 1024
 # 原始 HAR 使用临时文件流式解析；旧版 JSON 包装会先在内存中解码，需单独收紧。
 MAX_LEGACY_JSON_HAR_BYTES = 64 * 1024 * 1024
+# 管理/设置类 JSON 保持小预算；生成协议入口需要容纳百万级上下文。
 MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
+MAX_PROTOCOL_JSON_BODY_BYTES = 32 * 1024 * 1024
 MAX_SSE_BUFFER_BYTES = 2 * 1024 * 1024
 MAX_UPSTREAM_STREAM_WIRE_BYTES = 32 * 1024 * 1024
 MAX_UPSTREAM_STREAM_OUTPUT_BYTES = 16 * 1024 * 1024
@@ -911,14 +913,24 @@ _SSE_HEARTBEATS_SENT_TOTAL = 0
 _SSE_HEARTBEAT_ERRORS_TOTAL = 0
 UPLOAD_STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_CONTEXT_FILE_BYTES = 4 * 1024 * 1024
-# Empirical 2026-08-30/2026-09-05 boundary probes: GLM-5.3 reads a 48.5 KiB
-# text attachment through its final marker, while a 49 KiB file stops inside
-# the eighth definition. Keep generated segments at the verified 49 KiB-minus-
-# 512-byte edge; the 512-byte header reserve keeps each payload near 48 KiB.
-GLM53_CONTEXT_FILE_PART_BYTES = 49 * 1024 - 512
+# Generated history/tool transcripts are uploaded in 50 KiB segments. The
+# 512-byte reserve carries the segment header so every file, header included,
+# stays at or below 50 KiB. Keeping one uniform boundary also lets the
+# multi-wave preload path serve million-token contexts on every model.
+CONTEXT_FILE_PART_BYTES = 50 * 1024
+# Backward-compatible name: earlier releases documented the GLM-5.3 boundary
+# as 49 KiB minus a 512-byte header.
+GLM53_CONTEXT_FILE_PART_BYTES = CONTEXT_FILE_PART_BYTES
 CONTEXT_FILE_PART_HEADER_RESERVE_BYTES = 512
+# The upstream composer only accepts a small inline prompt safely (empirically
+# about 4K context). Larger contexts on a non-forcehistory model automatically
+# use the attachment/transcript path.
+INLINE_CONTEXT_MAX_TOKENS = 4_000
+# Upper bound on the cheap character check; also catches long unbroken
+# base64/minified runs that the word-based token estimate undercounts.
+INLINE_CONTEXT_MAX_CHARS = INLINE_CONTEXT_MAX_TOKENS * 4
 # The official composer accepts at most ten attachments on one completion
-# message. Larger GLM-5.3 context packages are loaded through one or more
+# message. Larger context packages are loaded through one or more
 # intentionally interrupted thinking turns, then completed on the same chat.
 ZAI_MAX_COMPLETION_FILES = 10
 # Per-account concurrency cap for in-flight upstream generations (Z.ai 429s beyond this).
@@ -4055,10 +4067,11 @@ HISTORY_PROMPT_CHARS = 8_000
 HISTORY_MSG_CHARS = 6_000
 HISTORY_MESSAGES_MAX = 30
 HISTORY_CONTEXT_CHARS = 16_000
-# A 2 MiB protocol request can produce slightly above forty 48 KiB GLM-5.3
+# A million-token protocol request can produce roughly one hundred 50 KiB
 # segments after transcript headers/tool guidance are added. Keep the complete
-# delivery manifest while remaining well below the 16 MiB detail-file budget.
-HISTORY_CONTEXT_FILES_MAX = 64
+# delivery manifest while remaining below the 16 MiB detail-file budget even
+# with JSON escaping overhead.
+HISTORY_CONTEXT_FILES_MAX = 192
 HISTORY_CONTEXT_FILE_CHARS = 80_000
 HISTORY_FINAL_CHARS = 40_000
 HISTORY_ANSWER_CHARS = 30_000
@@ -7425,6 +7438,39 @@ CLAUDE_FUNCTION_CALL_BLOCK_RE = re.compile(
 CLAUDE_CALLING_HEADER_RE = re.compile(
     r"\*\*Calling:\*\*\s*([A-Za-z0-9_.:-]{1,128})\s*", re.IGNORECASE
 )
+# Observed hybrid markup: the model starts a Claude-style <tool_call> but
+# fills it with XML/DSML <parameter> tags, or drops an </arg_key> close. The
+# block regex and the strict body parser below repair only unambiguous cases;
+# unknown leftovers still make the normal parser fail closed.
+HYBRID_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<tool_call\b[^>]*>(.*?)(?:</tool_call\s*>|</(?:\|{0,3}DSML\|{0,3}\s*)?tool_calls\s*>|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+HYBRID_INVOKE_HEADER_RE = re.compile(
+    r"\s*<??(?:\|?\s*DSML\s*\|?\s*)?invoke\s+name\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
+    re.IGNORECASE,
+)
+HYBRID_TOOL_NAME_HEADER_RE = re.compile(
+    r"\s*([A-Za-z0-9_.:-]{1,128})(?=\s|>|<|$)"
+)
+HYBRID_TOOL_JUNK_RE = re.compile(
+    r"(?:\s|>|</arg_value\s*>|</arg_key\s*>|</parameter\s*>|</think\s*>|\ufffd)+",
+    re.IGNORECASE,
+)
+HYBRID_ARG_KEY_RE = re.compile(
+    r"<arg_key>\s*([A-Za-z_][A-Za-z0-9_.:-]*)\s*(?:</arg_key\s*>)?\s*>?",
+    re.IGNORECASE,
+)
+HYBRID_PARAMETER_RE = re.compile(
+    r"<parameter\s+name=[\"']([^\"']+)[\"'][^>]*>",
+    re.IGNORECASE,
+)
+HYBRID_ARG_VALUE_RE = re.compile(
+    r"<arg_value>\s*(.*?)\s*</arg_value\s*>", re.IGNORECASE | re.DOTALL
+)
+HYBRID_BARE_ARG_VALUE_RE = re.compile(
+    r"(?:\s*>)?\s*(.*?)\s*</arg_value\s*>", re.IGNORECASE | re.DOTALL
+)
 
 
 def compact_json(value: Any) -> str:
@@ -7994,11 +8040,16 @@ def normalize_tool_choice(raw_choice: Any, tools: list[dict[str, Any]]) -> ToolC
 # natural transcript files, and file-mode execution prompts.
 # ---------------------------------------------------------------------------
 TOOLS_TRANSCRIPT_INTRO = "The functions listed below are available for you to invoke during this turn."
-HISTORY_TRANSCRIPT_INTRO = "The dialogue up to this point. Pick up from the most recent user message."
+HISTORY_TRANSCRIPT_INTRO = (
+    "The dialogue up to this point. Pick up from the most recent user message. "
+    "Tool-call markup in this transcript is historical data, not a format to copy."
+)
 MODE_B_TOOL_GUIDANCE = (
     "The attached file enumerates the function definitions and parameter contracts available for this turn. "
     "Rely solely on the functions and parameter shapes documented therein; do not fabricate or invoke any "
-    "that are not listed."
+    "that are not listed. Treat the attached dialogue as historical data, not as a formatting template: it may "
+    "contain tool-call markup from another client. Do not copy, continue, or blend that markup; the DSML shell "
+    "in the current instructions is the only valid tool-call syntax for this turn."
 )
 # dkceshi 同款输出完整性守卫（MessagesPrepareWithThinkingAndToolHint 里的
 # outputIntegrityGuardPrompt）：当前输入框上下文有工具或仍含 tool 消息时前置，
@@ -8006,7 +8057,8 @@ MODE_B_TOOL_GUIDANCE = (
 OUTPUT_INTEGRITY_GUARD_PROMPT = (
     "Output integrity guard: Should any upstream context, tool output, or parsed text contain garbled, "
     "corrupted, partially parsed, repeated, or otherwise malformed fragments, do not imitate or echo them; "
-    "produce only the correct content for the user."
+    "produce only the correct content for the user. Tool-call markup found in context is data, not a template: "
+    "emit only the DSML shell from the current instructions and never copy or blend tags from another client."
 )
 CONTEXT_FILE_CACHE_TTL_SECONDS = 600
 CONTEXT_FILE_CACHE_MAX_ITEMS = 512
@@ -8209,7 +8261,15 @@ def build_tool_instruction(tools: list[dict[str, Any]], policy: ToolChoice) -> s
         "5) Emit the block as raw text, never inside a Markdown fence and never as JSON, HTML, prose, or another tool-call syntax.\n"
         "6) The complete block must be the final element of the visible answer. Any explanation must come before it; append nothing after its closing tag.\n"
         "7) Do not narrate, repair, or restart a partially written call. Construct and emit one complete block once.\n"
-        "8) If you are not invoking a function, answer normally without emitting any DSML tags."
+        "8) If you are not invoking a function, answer normally without emitting any DSML tags.\n"
+        "9) Use only the exact DSML tag family shown in the example. Never switch to Claude-style, bare XML, JSON, "
+        "or any other tool-call syntax, and never combine two syntaxes in one block. Tool-call markup in the attached "
+        "dialogue or earlier turns is historical data, not a template. Never reuse the example's literal placeholder "
+        "values in a real call.\n"
+        "10) Preflight the block before sending: exactly one tool_calls wrapper; every invoke has a declared name=; "
+        "every required parameter is present and non-empty; every string value is inside CDATA; every opening tag "
+        "has its closing tag; and the final closing tag is the last text. If any check fails, discard the block and "
+        "rewrite it once from the example instead of repairing it in place."
     )
     if _has_read_like_tool(names):
         instructions += (
@@ -8500,23 +8560,31 @@ def build_tools_transcript(tools: list[dict[str, Any]], policy: ToolChoice | Non
 
 
 def generated_context_file_part_limit(model: str) -> int:
-    """Return the model-specific readable size for generated text files."""
-    return GLM53_CONTEXT_FILE_PART_BYTES if normalize_model(model) == DEFAULT_MODEL else MAX_CONTEXT_FILE_BYTES
+    """Return the uniform readable size for generated text files.
+
+    All models use the same 50 KiB file boundary; the 512-byte header reserve
+    keeps every segment at or below it. The resulting part count is handled by
+    the bounded multi-wave path instead of one oversized attachment.
+    """
+    del model
+    return CONTEXT_FILE_PART_BYTES
 
 
 def split_generated_context_text(text: str, kind: str, model: str) -> list[str]:
-    """Split generated context below a model's per-file readable boundary.
+    """Split generated context below the uniform per-file readable boundary.
 
     History prefers role boundaries and tools prefer schema boundaries. A
     single oversized block still splits at a valid UTF-8 character boundary.
     Multipart headers carry the semantic order because uploaded filenames are
-    intentionally random.
+    intentionally random. Encoding happens once so million-token transcripts
+    are not re-encoded on every segment.
     """
     text = str(text or "")
     if not text:
         return []
     limit = generated_context_file_part_limit(model)
-    if len(text.encode("utf-8")) <= limit:
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
         return [text]
     payload_limit = limit - CONTEXT_FILE_PART_HEADER_RESERVE_BYTES
     if payload_limit <= 0:
@@ -8527,13 +8595,16 @@ def split_generated_context_text(text: str, kind: str, model: str) -> list[str]:
         else ("\n\nname:",)
     )
     payloads: list[str] = []
-    remaining = text
-    while remaining:
-        raw = remaining.encode("utf-8")
-        if len(raw) <= payload_limit:
-            payloads.append(remaining)
+    offset = 0
+    while offset < len(raw):
+        chunk = raw[offset : offset + payload_limit]
+        if offset + payload_limit >= len(raw):
+            payloads.append(chunk.decode("utf-8"))
             break
-        prefix = raw[:payload_limit].decode("utf-8", errors="ignore")
+        # errors="ignore" drops only a trailing partial UTF-8 character; its
+        # bytes stay in the next chunk because offset advances by the decoded
+        # prefix length, not by payload_limit.
+        prefix = chunk.decode("utf-8", errors="ignore")
         cut = len(prefix)
         preferred = max((prefix.rfind(delimiter) for delimiter in delimiters), default=-1)
         if preferred >= len(prefix) // 2:
@@ -8542,8 +8613,9 @@ def split_generated_context_text(text: str, kind: str, model: str) -> list[str]:
             cut = preferred + 2
         if cut <= 0:
             raise ValueError("unable to split generated context at a UTF-8 boundary")
-        payloads.append(remaining[:cut])
-        remaining = remaining[cut:]
+        piece = prefix[:cut]
+        payloads.append(piece)
+        offset += len(piece.encode("utf-8"))
 
     total = len(payloads)
     label = "conversation history" if kind == "history" else "function definitions"
@@ -8605,6 +8677,21 @@ def build_context_package(surface: str, messages: list[dict[str, Any]], tools: l
     return "\n\n".join(parts).strip() + "\n"
 
 
+def should_auto_file_context(context_text: str) -> bool:
+    """Non-forcehistory models switch to the attachment path past the inline limit.
+
+    The web composer is reliable only for a short inline context.  Sending a
+    larger transcript directly in the prompt silently loses content, so default
+    routing upgrades to the same transcript-file path as ``-forcehistory``.
+    """
+    text = str(context_text or "")
+    if not text:
+        return False
+    if len(text) > INLINE_CONTEXT_MAX_CHARS:
+        return True
+    return estimate_protocol_tokens(text) > INLINE_CONTEXT_MAX_TOKENS
+
+
 def context_file_requested(
     body: dict[str, Any],
     surface: str,
@@ -8622,12 +8709,11 @@ def context_file_requested(
     )
     if explicit is not _MISSING:
         return coerce_bool(explicit, False)
-    # Match the reference project's explicit opt-in policy: regular model IDs
-    # pass the normalized context directly, while -forcehistory selects the
-    # uploaded transcript path.  The arguments stay in the signature so the
-    # caller can keep one decision point for every protocol surface.
-    del surface, messages, tools, context_text
-    return False
+    # Regular model IDs keep the inline path while the context fits the
+    # upstream composer; beyond that they transparently use the same transcript
+    # attachment flow as the -forcehistory variants.
+    del surface, messages, tools
+    return should_auto_file_context(context_text)
 
 
 def protocol_options_from_body(body: dict[str, Any], surface: str, include_thinking_default: bool) -> ChatOptions:
@@ -8826,6 +8912,14 @@ TOOL_TAG_CHAR_TRANSLATION = str.maketrans(
 
 def canonicalize_dsml_tool_markup(markup: str) -> str:
     markup = str(markup or "").translate(TOOL_TAG_CHAR_TRANSLATION)
+    # Upstream occasionally writes the DSML closing slash after the pipe:
+    # ``<|/DSML|parameter>`` instead of ``</|DSML|parameter>``.
+    markup = re.sub(
+        r"<\s*\|+\s*/\s*DSML\s*\|+\s*(tool_?calls|invoke|parameter)\s*[|!！、\x02]{0,3}>",
+        lambda match: f"</{match.group(1).lower().replace('toolcalls', 'tool_calls')}>",
+        markup,
+        flags=re.IGNORECASE,
+    )
     # 实测上游会漂移 DSML 分隔符、下划线和大小写，甚至把前缀与本地名黏连。
     # 仅在标签壳内接受这些变体，避免改写参数正文中的普通标点。
     pattern = re.compile(
@@ -9039,7 +9133,13 @@ def _tool_value_contains_placeholder(value: Any) -> bool:
 
 
 def _decode_claude_tool_argument(raw: str) -> Any:
-    text = html.unescape(str(raw or "").strip())
+    raw_text = str(raw or "").strip()
+    cdata = re.fullmatch(r"<!\[CDATA\[(.*?)\]\]>", raw_text, re.DOTALL)
+    if cdata is not None:
+        # CDATA content is literal; do not HTML-unescape it.
+        text = cdata.group(1)
+    else:
+        text = html.unescape(raw_text)
     parsed, valid = _parse_tool_json_value(text)
     return _repair_tool_path_controls(parsed) if valid else text
 
@@ -9061,11 +9161,20 @@ def _legacy_claude_tool_call(body: str) -> dict[str, Any] | None:
     previous_end = 0
     for value_match in value_matches:
         prefix = tail[previous_end : value_match.start()]
-        key_match = re.search(
-            r"(?:<arg_key>\s*)?([A-Za-z_][A-Za-z0-9_.:-]*)\s*</arg_key\s*>\s*$",
-            prefix,
-            re.IGNORECASE | re.DOTALL,
-        )
+        if "<arg_key" in prefix.lower():
+            # Accept a missing </arg_key> after an explicitly opened key; the
+            # next value boundary makes the pairing unambiguous.
+            key_match = re.search(
+                r"<arg_key>\s*([A-Za-z_][A-Za-z0-9_.:-]*)\s*(?:</arg_key\s*>)?\s*$",
+                prefix,
+                re.IGNORECASE | re.DOTALL,
+            )
+        else:
+            key_match = re.search(
+                r"([A-Za-z_][A-Za-z0-9_.:-]*)\s*</arg_key\s*>\s*$",
+                prefix,
+                re.IGNORECASE | re.DOTALL,
+            )
         if key_match is None:
             return None
         arguments[key_match.group(1)] = _decode_claude_tool_argument(value_match.group(1))
@@ -9165,6 +9274,99 @@ def _claude_style_tool_call_candidates(text: str) -> list[tuple[int, int, str, d
     return candidates
 
 
+def _strip_hybrid_value_junk(value: str) -> str:
+    return re.sub(
+        r"(?:</arg_value\s*>|</parameter\s*>|</think\s*>|\ufffd)+\s*$",
+        "",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _hybrid_tool_call(body: str) -> dict[str, Any] | None:
+    """Parse one <tool_call> body that mixes Claude, XML, and DSML shells.
+
+    Only unambiguous structures are accepted: a valid tool identifier, a
+    sequence of key/value pairs, and no unrecognized non-whitespace leftovers.
+    A truncated final parameter is allowed because the closing tag being
+    missing cannot change which value belongs to the already-open key.
+    """
+    body = canonicalize_dsml_tool_markup(str(body or ""))
+    body = re.sub(r"</tool_call\s*>\s*$", "", body, flags=re.IGNORECASE | re.DOTALL)
+    header = HYBRID_INVOKE_HEADER_RE.match(body)
+    if header is not None:
+        name = header.group(1).strip()
+        position = header.end()
+    else:
+        header = HYBRID_TOOL_NAME_HEADER_RE.match(body)
+        if header is None:
+            return None
+        name = header.group(1).strip()
+        position = header.end()
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name):
+        return None
+
+    arguments: dict[str, Any] = {}
+    while position < len(body):
+        rest = body[position:]
+        junk = HYBRID_TOOL_JUNK_RE.match(rest)
+        if junk is not None:
+            position += junk.end()
+            continue
+        closing = re.match(r"</(?:invoke|tool_calls)\s*>", rest, re.IGNORECASE)
+        if closing is not None:
+            position += closing.end()
+            continue
+        key = HYBRID_ARG_KEY_RE.match(rest)
+        if key is not None:
+            key_name = key.group(1)
+            position += key.end()
+            value_rest = body[position:]
+            value = HYBRID_ARG_VALUE_RE.match(value_rest)
+            if value is not None:
+                raw_value = value.group(1)
+                position += value.end()
+            else:
+                value = HYBRID_BARE_ARG_VALUE_RE.match(value_rest)
+                if value is None:
+                    return None
+                raw_value = value.group(1)
+                if re.search(r"<(?:arg_key|arg_value|parameter)\b", raw_value, re.IGNORECASE):
+                    return None
+                position += value.end()
+            arguments[key_name] = _decode_claude_tool_argument(raw_value)
+            continue
+        parameter = HYBRID_PARAMETER_RE.match(rest)
+        if parameter is not None:
+            key_name = parameter.group(1).strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]*", key_name):
+                return None
+            position += parameter.end()
+            close = re.search(r"</parameter\s*>", body[position:], re.IGNORECASE)
+            if close is not None:
+                raw_value = body[position : position + close.start()]
+                position += close.end()
+            else:
+                # Truncated final parameter: everything left belongs to it.
+                raw_value = body[position:]
+                position = len(body)
+            arguments[key_name] = _decode_claude_tool_argument(_strip_hybrid_value_junk(raw_value))
+            continue
+        return None
+    if not arguments:
+        return None
+    return {"name": name, "arguments": arguments}
+
+
+def _hybrid_tool_call_candidates(text: str) -> list[tuple[int, int, str, dict[str, Any]]]:
+    candidates: list[tuple[int, int, str, dict[str, Any]]] = []
+    for match in HYBRID_TOOL_CALL_BLOCK_RE.finditer(str(text or "")):
+        raw_call = _hybrid_tool_call(match.group(1))
+        if raw_call is not None:
+            candidates.append((match.start(), match.end(), match.group(0), raw_call))
+    return candidates
+
+
 def parse_claude_style_tool_calls(
     text: str,
     tools: list[dict[str, Any]],
@@ -9217,6 +9419,16 @@ def parse_tool_calls_from_output(
     result = parse_claude_style_tool_calls(visible_for_parse, tools, policy, id_prefix=id_prefix)
     if result:
         return result
+    hybrid_candidates = _hybrid_tool_call_candidates(visible_for_parse)
+    if hybrid_candidates:
+        log_event("tool_markup_hybrid_repaired", blocks=len(hybrid_candidates))
+        return normalize_tool_call_candidates(
+            [raw_call for _start, _end, _block, raw_call in hybrid_candidates],
+            tools,
+            policy,
+            id_prefix=id_prefix,
+            strict=True,
+        )
     if visible_for_parse.startswith("{") and visible_for_parse.endswith("}"):
         parsed = json_or_none(visible_for_parse)
         if isinstance(parsed, dict):
@@ -9280,7 +9492,8 @@ def protocol_request_with_tool_retry_hint(
     hint += (
         f"Decide again whether a tool is needed. Use only these names: {', '.join(allowed_names)}. "
         "If needed, put one complete raw DSML block in the visible final answer, follow the declared schema exactly, "
-        "and leave no executable call only in reasoning/thinking."
+        "and leave no executable call only in reasoning/thinking. Do not use Claude-style, bare XML, JSON, or mixed "
+        "tool-call tags, and do not copy markup from the dialogue history."
     )
     if example:
         hint += "\n\nFresh serialization example:\n" + _render_tool_example_block(example[0], example[1])
@@ -9309,6 +9522,19 @@ def strip_parsed_tool_markup(text: str) -> str:
     protected = TOOL_JSON_WRAPPER_RE.sub("", protected)
     protected = TOOL_XML_BLOCK_RE.sub("", protected)
     protected = CLAUDE_TOOL_CALL_BLOCK_RE.sub("", protected)
+    # A hybrid block can end with a DSML close (or be truncated) instead of
+    # </tool_call>; remove only a trailing block that clearly contains argument
+    # markup so ordinary prose mentioning <tool_call> survives.
+    last_open = protected.lower().rfind("<tool_call")
+    if last_open >= 0 and re.search(r"</tool_call\s*>", protected[last_open:], re.IGNORECASE) is None:
+        tail = protected[last_open:]
+        if re.search(r"<(?:arg_key|arg_value|parameter)\b|<\|DSML\|", tail, re.IGNORECASE):
+            match = re.match(
+                r"<tool_call\b[^>]*>.*?(?:</(?:\|{0,3}DSML\|{0,3}\s*)?tool_calls\s*>|\Z)",
+                tail,
+                re.IGNORECASE | re.DOTALL,
+            )
+            protected = protected[:last_open] + (tail[match.end() :] if match else "")
     protected = CLAUDE_TOOL_INPUT_CALL_RE.sub("", protected)
     protected = CLAUDE_FUNCTION_CALL_BLOCK_RE.sub("", protected)
     # ``**Calling:** name`` has no closing tag; remove only spans whose
@@ -9337,7 +9563,7 @@ def strip_parsed_tool_markup(text: str) -> str:
     # removing the tags) preserves whatever the model actually said.
     protected = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", protected, flags=re.DOTALL)
     protected = re.sub(
-        r"</?\s*(?:\|{0,3}DSML\|{0,3}\s*)?(?:glm2api_)?(?:tool_calls|invoke|parameter)\b[^>]*>",
+        r"</?\s*(?:\|{0,3}DSML\|{0,3}\s*)?(?:glm2api_)?(?:tool_calls|tool_call|invoke|parameter|arg_key|arg_value)\b[^>]*>",
         "",
         protected,
         flags=re.IGNORECASE,
@@ -9358,7 +9584,7 @@ _TOOL_TAG_RE = re.compile(
 
 def _canonical_realtime_tool_tag(tag: str) -> str:
     lowered = str(tag or "").lower()
-    if lowered in {"toolcall", "toolcalls"}:
+    if lowered in {"toolcall", "toolcalls", "tool_call"}:
         return "tool_calls"
     if lowered == "functioncall":
         return "function_call"
@@ -10291,16 +10517,16 @@ def prepare_protocol_upstream_request(
         ]
         deferred_trace = deferred_history_trace + deferred_tools_trace
         if len(deferred_trace) + len(files) > ZAI_MAX_COMPLETION_FILES:
-            if normalize_model(request.options.model) == DEFAULT_MODEL:
-                if trace_out is not None:
-                    trace_out["delivery_mode"] = "file"
-                    trace_out["context_files"] = deferred_trace
-                    trace_out["deferred_context_upload"] = True
-                # The caller uploads each wave immediately before it is sent.
-                # This avoids uploading the entire package up front and
-                # matches the official stop/continue ordering.
-                return apply_output_integrity_guard(request.execution_prompt, effective_tools, []), files
-            raise ValueError(f"Z.ai allows at most {ZAI_MAX_COMPLETION_FILES} files per completion")
+            if trace_out is not None:
+                trace_out["delivery_mode"] = "file"
+                trace_out["context_files"] = deferred_trace
+                trace_out["deferred_context_upload"] = True
+            # The caller uploads each wave immediately before it is sent.
+            # This avoids uploading the entire package up front and matches
+            # the official stop/continue ordering.  Every model uses the same
+            # bounded preload protocol so a million-token transcript is not
+            # rejected by the ten-attachment composer limit.
+            return apply_output_integrity_guard(request.execution_prompt, effective_tools, []), files
         generated_files: list[dict[str, Any]] = []
         owned_generated_files: list[dict[str, Any]] = []
         generated_trace: list[dict[str, Any]] = []
@@ -11451,10 +11677,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             ]
             history_parts.sort(key=lambda item: int(item.get("part") or 1))
             mirror_context = "\n\n".join(str(item.get("content") or "") for item in history_parts)
-        if (
-            delivery_trace.get("deferred_context_upload") is True
-            and normalize_model(request.options.model) == DEFAULT_MODEL
-        ):
+        if delivery_trace.get("deferred_context_upload") is True:
             if not create_chat:
                 log_event(
                     "context_staging_reuse_degraded",
@@ -12759,6 +12982,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "function_tools": True,
                         "context_file": True,
                         "context_file_default": False,
+                        "context_file_auto_above_tokens": INLINE_CONTEXT_MAX_TOKENS,
+                        "context_file_auto_above_chars": INLINE_CONTEXT_MAX_CHARS,
+                        "context_file_part_bytes": CONTEXT_FILE_PART_BYTES,
                         "force_history_suffix": FORCE_HISTORY_MODEL_SUFFIX,
                         "auto_delete_after_completion_default": DEFAULT_DELETE_CHAT_AFTER_COMPLETION,
                         "chunked_request_body": True,
@@ -12787,6 +13013,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "har_upload_bytes": MAX_HAR_UPLOAD_BYTES,
                         "legacy_json_har_bytes": MAX_LEGACY_JSON_HAR_BYTES,
                         "json_body_bytes": MAX_JSON_BODY_BYTES,
+                        "protocol_json_body_bytes": MAX_PROTOCOL_JSON_BODY_BYTES,
+                        "context_file_part_bytes": CONTEXT_FILE_PART_BYTES,
+                        "inline_context_max_tokens": INLINE_CONTEXT_MAX_TOKENS,
+                        "inline_context_max_chars": INLINE_CONTEXT_MAX_CHARS,
+                        "context_file_parts": HISTORY_CONTEXT_FILES_MAX,
                         "upstream_stream_wire_bytes": MAX_UPSTREAM_STREAM_WIRE_BYTES,
                         "upstream_stream_output_bytes": MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
                         "upstream_stream_events": MAX_UPSTREAM_STREAM_EVENTS,
@@ -12991,7 +13222,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     @_chat_slot_guard("_openai_busy", "_openai_profile_missing")
     def _handle_openai_chat_completions(self) -> None:
         try:
-            body = self._read_json_body()
+            body = self._read_json_body(max_bytes=MAX_PROTOCOL_JSON_BODY_BYTES)
             request = normalize_openai_chat_request(body, self.api_include_thinking_default)
             if not self._acquire_deferred_chat_slot():
                 return
@@ -13282,7 +13513,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     @_chat_slot_guard("_openai_busy", "_openai_profile_missing")
     def _handle_openai_responses(self) -> None:
         try:
-            body = self._read_json_body()
+            body = self._read_json_body(max_bytes=MAX_PROTOCOL_JSON_BODY_BYTES)
             previous_response_id = str(body.get("previous_response_id") or "").strip()
             prior_messages: list[dict[str, Any]] | None = None
             if previous_response_id:
@@ -13746,7 +13977,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     @_chat_slot_guard("_anthropic_busy", "_anthropic_profile_missing")
     def _handle_anthropic_messages(self) -> None:
         try:
-            body = self._read_json_body()
+            body = self._read_json_body(max_bytes=MAX_PROTOCOL_JSON_BODY_BYTES)
             if "max_tokens" in body and int(body["max_tokens"]) <= 0:
                 raise ValueError("max_tokens must be positive")
             request = normalize_anthropic_messages_request(body, self.api_include_thinking_default)
@@ -13771,7 +14002,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_anthropic_count_tokens(self) -> None:
         try:
-            body = self._read_json_body()
+            body = self._read_json_body(max_bytes=MAX_PROTOCOL_JSON_BODY_BYTES)
             request = normalize_anthropic_messages_request(body, self.api_include_thinking_default)
             self._json_response(200, {"input_tokens": estimate_protocol_tokens(request.context_text)})
         except Exception as exc:
@@ -13963,7 +14194,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _handle_web_chat(self) -> None:
         streaming_started = False
         try:
-            body = self._read_json_body()
+            body = self._read_json_body(max_bytes=MAX_PROTOCOL_JSON_BODY_BYTES)
             prompt = self._prompt_from_body(body)
             stream = coerce_bool(body.get("stream", True), True)
             options = chat_options_from_body(body, include_thinking_default=self.include_thinking)

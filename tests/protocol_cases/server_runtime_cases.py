@@ -2286,7 +2286,7 @@ class ServerRuntimeCases:
         before = app.RUNTIME_METRICS.snapshot()["request_too_large"]
         QuietProxyHandler.chat_inflight = {}
         try:
-            oversized = app.MAX_JSON_BODY_BYTES + 1
+            oversized = app.MAX_PROTOCOL_JSON_BODY_BYTES + 1
             fixed_request = (
                 b"POST /v1/chat/completions HTTP/1.1\r\n"
                 b"Host: 127.0.0.1\r\n"
