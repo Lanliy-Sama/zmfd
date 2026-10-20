@@ -7422,6 +7422,13 @@ MAX_TOOL_CALLS_PER_TURN = 128
 # single 107-call batch to pass, so there is no artificial lower target.
 MODEL_SAFE_TOOL_CALLS_PER_TURN = MAX_TOOL_CALLS_PER_TURN
 MAX_TOOL_ARGUMENTS_BYTES = 256 * 1024
+# DSML 分隔符在实际输出中漂移很大：`|`、`!`、全角 `！`、`、`、控制字符 \x02，
+# 以及观测到的 GLM 分词碎片 DEL(\x7f)/LOW ONE(▁) 都会出现在 <|DSML| 壳里。
+# 统一一个字符类，供规范化、块识别、实时扫描共用，避免各处白名单不一致。
+_DSML_SEP_CHARS = "|!！、\x02\x7f\u2580-\u259f"
+_DSML_SEP_CLASS = "[" + _DSML_SEP_CHARS + "]"
+_DSML_SEP_RUN = _DSML_SEP_CLASS + "{0,3}"
+
 TOOL_JSON_WRAPPER_RE = re.compile(
     r"<glm2api_tool_calls>\s*(\{.*?\})\s*</glm2api_tool_calls\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -7429,7 +7436,7 @@ TOOL_JSON_WRAPPER_RE = re.compile(
 # DSML tags may carry a trailing pipe (DeepSeek-style `<|DSML|tool_calls|>`);
 # the pipe is consumed before attributes/`>` so both spellings canonicalize.
 TOOL_XML_BLOCK_RE = re.compile(
-    r"<(?:\|?DSML\|?)?(?:glm2api_)?tool_calls\|?(?:\s[^>]*)?>.*?</(?:\|?DSML\|?)?(?:glm2api_)?tool_calls\|?\s*>",
+    r"<(?:" + _DSML_SEP_CLASS + r"?DSML" + _DSML_SEP_CLASS + r"?)?(?:glm2api_)?tool_calls" + _DSML_SEP_CLASS + r"?(?:\s[^>]*)?>.*?</(?:" + _DSML_SEP_CLASS + r"?DSML" + _DSML_SEP_CLASS + r"?)?(?:glm2api_)?tool_calls" + _DSML_SEP_CLASS + r"?\s*>",
     re.IGNORECASE | re.DOTALL,
 )
 CLAUDE_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call\s*>", re.IGNORECASE | re.DOTALL)
@@ -7448,7 +7455,7 @@ CLAUDE_CALLING_HEADER_RE = re.compile(
 # block regex and the strict body parser below repair only unambiguous cases;
 # unknown leftovers still make the normal parser fail closed.
 HYBRID_TOOL_CALL_BLOCK_RE = re.compile(
-    r"<tool_call\b[^>]*>(.*?)(?:</tool_call\s*>|</(?:\|{0,3}DSML\|{0,3}\s*)?tool_calls\s*>|\Z)",
+    r"<tool_call\b[^>]*>(.*?)(?:</tool_call\s*>|</(?:" + _DSML_SEP_RUN + r"\s*DSML\s*" + _DSML_SEP_RUN + r"\s*)?tool_calls\s*>|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
 HYBRID_INVOKE_HEADER_RE = re.compile(
@@ -9007,7 +9014,7 @@ def canonicalize_dsml_tool_markup(markup: str) -> str:
     # Upstream occasionally writes the DSML closing slash after the pipe:
     # ``<|/DSML|parameter>`` instead of ``</|DSML|parameter>``.
     markup = re.sub(
-        r"<\s*\|+\s*/\s*DSML\s*\|+\s*(tool_?calls|invoke|parameter)\s*[|!！、\x02]{0,3}>",
+        r"<\s*" + _DSML_SEP_CLASS + r"+\s*/\s*DSML\s*" + _DSML_SEP_CLASS + r"+\s*(tool_?calls|invoke|parameter)\s*" + _DSML_SEP_RUN + r">",
         lambda match: f"</{match.group(1).lower().replace('toolcalls', 'tool_calls')}>",
         markup,
         flags=re.IGNORECASE,
@@ -9015,8 +9022,8 @@ def canonicalize_dsml_tool_markup(markup: str) -> str:
     # 实测上游会漂移 DSML 分隔符、下划线和大小写，甚至把前缀与本地名黏连。
     # 仅在标签壳内接受这些变体，避免改写参数正文中的普通标点。
     pattern = re.compile(
-        r"<\s*(/?)\s*(?:[|!！、\x02]{0,3}\s*DSML\s*[|!！、\x02]{0,3}\s*)?"
-        r"(tool_?calls|invoke|parameter)([^>]*?)[|!！、\x02]{0,3}>",
+        r"<\s*(/?)\s*(?:" + _DSML_SEP_RUN + r"\s*DSML\s*" + _DSML_SEP_RUN + r"\s*)?"
+        r"(tool_?calls|invoke|parameter)([^>]*?)" + _DSML_SEP_RUN + r">",
         re.IGNORECASE,
     )
 
@@ -9031,7 +9038,25 @@ def canonicalize_dsml_tool_markup(markup: str) -> str:
             return f"</{tag}>"
         return f"<{slash}{tag}{tail}>"
 
-    return pattern.sub(replace, markup)
+    markup = pattern.sub(replace, markup)
+    # GLM 分词碎片会把 ``<|DSML|`` 变成 ``<\x7foo\x7f▁DSML▁`` 这类"分隔符里夹
+    # 着噪声词"的形态。上面要求 DSML 直接跟在分隔符后，无法命中；这里单独把
+    # 仍残留的 ``<...DSML<sep>tag`` 壳折叠成规范标签。仅处理 DSML 壳，不改写正文。
+    fragment = re.compile(
+        r"<\s*(/?)\s*(?:(?:" + _DSML_SEP_CLASS + r"|[A-Za-z0-9_])*\s*)DSML\s*"
+        + _DSML_SEP_RUN + r"\s*(tool_?calls|invoke|parameter)([^>]*?)" + _DSML_SEP_RUN + r">",
+        re.IGNORECASE,
+    )
+    markup = fragment.sub(replace, markup)
+    # 折叠后标签名前可能仍残留分隔符（如 ``<invoke\x7f name=``）；仅对工具标签
+    # 去掉这部分残留，保持 ``[^>]*`` 属性不动。
+    markup = re.sub(
+        r"<(/?)(tool_calls|invoke|parameter)" + _DSML_SEP_CLASS + r"+(?=[\s>/])",
+        r"<\1\2",
+        markup,
+        flags=re.IGNORECASE,
+    )
+    return markup
 
 
 def _tool_markup_candidate(markup: str) -> str:
@@ -9375,6 +9400,160 @@ def _strip_hybrid_value_junk(value: str) -> str:
     ).strip()
 
 
+def _clean_hybrid_parameter_value(value: str) -> str:
+    """Clean a raw parameter value, cutting it at the next markup boundary.
+
+    A truncated parameter value can absorb the following ``</think>`` and the
+    next ``<parameter ...>`` fragment; the argument only spans up to the first
+    such tag. CDATA content is literal and unwrapped.
+    """
+    text = str(value or "")
+    cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", text, re.DOTALL)
+    if cdata is not None:
+        return cdata.group(1).strip()
+    cut = re.search(
+        r"</?(?:arg_key|arg_value|parameter|invoke|tool_calls|think)\b[^>]*>"
+        r"|<!\[CDATA\[",
+        text,
+        re.IGNORECASE,
+    )
+    if cut is not None:
+        text = text[: cut.start()]
+    return _strip_hybrid_value_junk(text)
+
+
+_HYBRID_FUSED_ARG_VALUE_RE = re.compile(
+    r"</arg_value\s*>\s*([A-Za-z_][A-Za-z0-9_.:-]*)\s*",
+    re.IGNORECASE,
+)
+
+# Keys that are markup local names or the tool itself, never real arguments.
+_HYBRID_NON_ARG_KEYS = {
+    "arg_value", "arg_key", "parameter", "invoke", "tool_calls", "think", "args",
+}
+
+
+def _salvage_claude_tool_call_remains(
+    name: str, rest: str
+) -> tuple[dict[str, Any], str] | None:
+    """Recover arguments from Claude-style markup that lost its key/value shell.
+
+    Returns ``(arguments, residue)`` when at least one unambiguous value was
+    recovered; ``residue`` is the surviving well-formed ``<parameter>`` markup
+    for the strict pair loop (empty when everything was consumed). Returns
+    ``None`` when nothing salvageable is present, leaving ``rest`` untouched.
+    """
+    text = str(rest or "")
+    if not text.strip():
+        return None
+    # The strict pair loop already handles markup that still uses the Claude
+    # ``<arg_key>``/``<arg_value>`` shell; only step in when that shell is gone
+    # (bare ``args>``, ``</ToolName>`` pseudo closes, fused ``</arg_value>``).
+    if re.search(r"<arg_key\b|<arg_value\b", text, re.IGNORECASE):
+        return None
+    arguments: dict[str, Any] = {}
+    consumed_spans: list[tuple[int, int]] = []
+
+    def claim(start: int, end: int) -> None:
+        consumed_spans.append((start, end))
+
+    def spans_overlap(start: int, end: int) -> bool:
+        return any(start < c_end and end > c_start for c_start, c_end in consumed_spans)
+
+    def value_from(raw: str) -> Any:
+        cleaned = str(raw or "").strip()
+        # A CDATA wrapper is literal. Take the first complete one: a fused
+        # ``</arg_value>key<![CDATA[v]]>`` value is that CDATA; anything after a
+        # stray ``</think>``/``<parameter`` belongs to the next parameter, not
+        # this value. An unterminated CDATA runs to its segment end.
+        cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", cleaned, re.DOTALL)
+        if cdata is None:
+            cdata = re.search(r"<!\[CDATA\[(.*)$", cleaned, re.DOTALL)
+        if cdata is not None:
+            cleaned = cdata.group(1)
+        else:
+            cleaned = _clean_hybrid_parameter_value(cleaned)
+        return _decode_claude_tool_argument(cleaned)
+
+    def first_close(segment: str) -> int:
+        # A pseudo close may reuse the tool name without its ``>`` (``</Skill``
+        # cut short), so accept the name with or without the closing bracket.
+        match = re.search(
+            r"</(?:arg_value|args|parameter|invoke|tool_calls|think)\s*>"
+            r"|</\s*" + re.escape(name) + r"(?:\s*>|\s*$)",
+            segment,
+            re.IGNORECASE,
+        )
+        return match.start() if match else len(segment)
+
+    # 1) Bare ``args><![CDATA[value]]`` / ``args>value`` / ``args<![CDATA[...``
+    #    (``args`` is the observed free-form argument name on Skill/computer-use
+    #    style tools). The model sometimes drops the ``>`` after the key.
+    bare = re.search(r"\bargs\s*>?", text, re.IGNORECASE)
+    if bare is not None:
+        value_start = bare.end()
+        value_end = value_start + first_close(text[value_start:])
+        arguments["args"] = value_from(text[value_start:value_end])
+        claim(bare.start(), value_end)
+
+    # 2) Fused ``</arg_value>key<![CDATA[value]]>`` pairs (the model closing a
+    #    previous value and gluing the next key+value straight onto it).
+    for fused in _HYBRID_FUSED_ARG_VALUE_RE.finditer(text):
+        key = fused.group(1)
+        # A key matching a markup local name is a fragment, not an argument.
+        # Do NOT skip a key that merely equals the tool name: tools like Skill
+        # legitimately take a ``skill`` argument.
+        if key.lower() in _HYBRID_NON_ARG_KEYS:
+            continue
+        value_start = fused.end()
+        value_end = value_start + first_close(text[value_start:])
+        raw_value = text[value_start:value_end]
+        if not raw_value.strip():
+            continue
+        # The value is only trustworthy when it carries a CDATA payload or
+        # stops at a real close tag; a bare word running to end-of-text is
+        # usually a leaked tag fragment rather than an argument.
+        has_cdata = "<![CDATA[" in raw_value
+        stopped_at_close = value_end < len(text)
+        if not has_cdata and not stopped_at_close:
+            continue
+        arguments[key] = value_from(raw_value)
+        claim(fused.start(), value_end)
+
+    # 3) Keep intact ``<parameter name="k">v</parameter>`` blocks not part of a
+    #    salvaged span for the strict loop, and recover parameters truncated by
+    #    a stray ``</think>`` (value runs to that tag, no ``</parameter>``).
+    residue_parts: list[str] = []
+    for param in re.finditer(
+        r"<parameter\s+name=[\"'][^\"']+[\"'][^>]*>.*?</parameter\s*>",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        if spans_overlap(param.start(), param.end()):
+            continue
+        residue_parts.append(param.group(0))
+    for param in re.finditer(
+        r"<parameter\s+name=[\"']([^\"']+)[\"'][^>]*>(.*?)</think\s*>",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        if spans_overlap(param.start(), param.end()):
+            continue
+        key = param.group(1).strip()
+        if key.lower() in _HYBRID_NON_ARG_KEYS:
+            continue
+        value = value_from(param.group(2))
+        existing = arguments.get(key)
+        # Prefer the value that does not itself contain leftover tag fragments.
+        if existing is None or ("<" in str(existing) and "<" not in str(value)):
+            arguments[key] = value
+        claim(param.start(), param.end())
+
+    if not arguments:
+        return None
+    return arguments, "\n".join(residue_parts)
+
+
 def _hybrid_tool_call(body: str) -> dict[str, Any] | None:
     """Parse one <tool_call> body that mixes Claude, XML, and DSML shells.
 
@@ -9398,7 +9577,23 @@ def _hybrid_tool_call(body: str) -> dict[str, Any] | None:
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name):
         return None
 
+    # The model frequently drops the Claude `<arg_key>`/`<arg_value>` shell and
+    # emits a bare ``args><![CDATA[...]]`` fragment, a ``</ToolName>`` pseudo
+    # closing tag, or a ``</arg_value>`` blob that fuses the next key with its
+    # own CDATA value. Salvage those unambiguous leftovers into the pending
+    # argument (or the matching named one) before the strict pair loop runs.
     arguments: dict[str, Any] = {}
+    if name and name.lower() != "args":
+        salvaged = _salvage_claude_tool_call_remains(name, body[position:])
+        if salvaged is not None:
+            arguments, residue = salvaged
+            if not residue.strip():
+                return {"name": name, "arguments": arguments} if arguments else None
+            # Re-scan the surviving well-formed parameter blocks from the start
+            # so the strict pair loop can merge them into the salvaged values.
+            body = residue
+            position = 0
+
     while position < len(body):
         rest = body[position:]
         junk = HYBRID_TOOL_JUNK_RE.match(rest)
@@ -9442,7 +9637,7 @@ def _hybrid_tool_call(body: str) -> dict[str, Any] | None:
                 # Truncated final parameter: everything left belongs to it.
                 raw_value = body[position:]
                 position = len(body)
-            arguments[key_name] = _decode_claude_tool_argument(_strip_hybrid_value_junk(raw_value))
+            arguments[key_name] = _decode_claude_tool_argument(_clean_hybrid_parameter_value(raw_value))
             continue
         return None
     if not arguments:
@@ -9616,15 +9811,20 @@ def strip_parsed_tool_markup(text: str) -> str:
     protected = TOOL_JSON_WRAPPER_RE.sub("", protected)
     protected = TOOL_XML_BLOCK_RE.sub("", protected)
     protected = CLAUDE_TOOL_CALL_BLOCK_RE.sub("", protected)
+    # Remove any hybrid <tool_call> block the parser actually recovered (it may
+    # end at a DSML close or run to end-of-text) so its argument values never
+    # leak into the visible answer beside the native tool call.
+    for _start, _end, block, _raw_call in reversed(_hybrid_tool_call_candidates(protected)):
+        protected = protected.replace(block, "", 1)
     # A hybrid block can end with a DSML close (or be truncated) instead of
     # </tool_call>; remove only a trailing block that clearly contains argument
     # markup so ordinary prose mentioning <tool_call> survives.
     last_open = protected.lower().rfind("<tool_call")
     if last_open >= 0 and re.search(r"</tool_call\s*>", protected[last_open:], re.IGNORECASE) is None:
         tail = protected[last_open:]
-        if re.search(r"<(?:arg_key|arg_value|parameter)\b|<\|DSML\|", tail, re.IGNORECASE):
+        if re.search(r"<(?:arg_key|arg_value|parameter)\b|" + _DSML_SEP_CLASS + r"*DSML", tail, re.IGNORECASE):
             match = re.match(
-                r"<tool_call\b[^>]*>.*?(?:</(?:\|{0,3}DSML\|{0,3}\s*)?tool_calls\s*>|\Z)",
+                r"<tool_call\b[^>]*>.*?(?:</(?:" + _DSML_SEP_RUN + r"\s*DSML\s*" + _DSML_SEP_RUN + r"\s*)?tool_calls\s*>|\Z)",
                 tail,
                 re.IGNORECASE | re.DOTALL,
             )
@@ -9670,7 +9870,10 @@ REALTIME_TOOL_BLOCK_CHARS = 4 * 1024 * 1024
 REALTIME_JSON_HOLD_LIMIT = MAX_TOOL_ARGUMENTS_BYTES + 64 * 1024
 
 _TOOL_TAG_RE = re.compile(
-    r"<\s*(/?)\s*(?:\|{0,3}\s*DSML\s*\|{0,3}\s*)?"
+    r"<\s*(/?)\s*(?:"
+    + _DSML_SEP_RUN + r"\s*DSML\s*" + _DSML_SEP_RUN + r"\s*"
+    + r"|(?:" + _DSML_SEP_CLASS + r"|[A-Za-z0-9_])*\s*DSML\s*" + _DSML_SEP_RUN + r"\s*"
+    + r")?"
     r"([A-Za-z_][A-Za-z0-9_.-]*)([^>]*)>",
     re.IGNORECASE,
 )
@@ -9719,13 +9922,36 @@ def _realtime_could_be_tool_prefix(tail: str) -> bool:
     rest = translated[1:].lstrip()
     if ">" in rest:
         return False
-    rest = re.sub(r"^[|!！、\x02]{0,3}\s*", "", rest)
+    tool_names = ("tool_calls", "tool_call", "function_call", "invoke", "parameter")
+    # Split into separator-delimited segments so a GLM fragment shell like
+    # ``<\x7foo\x7f▁DSML▁t`` yields ["oo", "DSML", "t"] and the tag name can be
+    # recognized even when a noise word is glued onto the DSML prefix.
+    segments = [seg.strip().lower() for seg in re.split(_DSML_SEP_CLASS + r"+|\s+", rest) if seg.strip()]
+    if segments:
+        last = segments[-1]
+        if last in {"dsml", "glm2api"} or "dsml".startswith(last) or "glm2api".startswith(last):
+            return True
+        if any(name.startswith(last) or last.startswith(name) for name in tool_names):
+            return True
+        if any("dsml".startswith(seg) or seg.startswith("dsml") for seg in segments):
+            return True
+        if any(seg in {"dsml", "glm2api"} or "glm2api".startswith(seg) for seg in segments):
+            return True
+        # A single short fragment (e.g. "oo") may be noise inside a DSML shell
+        # that has not reached the tag yet; hold it while separators are present.
+        if len(segments) == 1 and re.search(_DSML_SEP_CLASS, rest) and len(last) <= 4 and last.isalpha():
+            return True
+        return False
+    # Only separators so far: still growing toward a possible tag.
+    if re.fullmatch(r"(?:" + _DSML_SEP_CLASS + r"|\s)+", rest):
+        return True
+    rest = re.sub(r"^" + _DSML_SEP_RUN + r"\s*", "", rest)
     lowered = rest.lower()
     if "dsml".startswith(lowered):
         return True
     if lowered.startswith("dsml"):
         rest = rest[4:].lstrip()
-        rest = re.sub(r"^[|!！、\x02]{0,3}\s*", "", rest)
+        rest = re.sub(r"^" + _DSML_SEP_RUN + r"\s*", "", rest)
         lowered = rest.lower()
     if "glm2api_".startswith(lowered) or lowered.startswith("glm2api"):
         if lowered.startswith("glm2api_"):
@@ -9735,7 +9961,7 @@ def _realtime_could_be_tool_prefix(tail: str) -> bool:
             return True
     if not lowered:
         return True
-    for name in ("tool_calls", "tool_call", "function_call", "invoke", "parameter"):
+    for name in tool_names:
         if name.startswith(lowered):
             return True
         if lowered.startswith(name):

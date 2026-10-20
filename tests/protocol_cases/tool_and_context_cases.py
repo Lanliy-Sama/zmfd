@@ -962,6 +962,130 @@ class ToolAndContextCases:
         self.assertEqual("先说明一下。", "".join(malformed_text_actions))
         self.assertTrue(all("<tool_call" not in value for value in malformed_text_actions))
 
+    def test_observed_fragmented_dsml_shell_is_parsed_and_streamed(self) -> None:
+        # Real GLM output fragmented the DSML shell into ``<\x7foo\x7f▁DSML▁``
+        # (DEL / "oo" / LOW ONE tokenizer pieces). This previously raised
+        # ToolCallFormatError("...无法转换") and failed the whole streaming turn.
+        tools = [
+            {
+                "name": "ToolSearch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}},
+                    "required": ["query", "max_results"],
+                },
+            }
+        ]
+        policy = app.ToolChoice(mode="auto")
+        markup = (
+            "<\x7foo\x7f\u2581DSML\u2581tool_calls\x7f>\n"
+            '  <\x7foo\x7f\u2581DSML\u2581invoke\x7f name="ToolSearch">\n'
+            '    <\x7foo\x7f\u2581DSML\u2581parameter\x7f name="query"><![CDATA[select:WebFetch]]></\x7foo\x7f\u2581DSML\u2581parameter>\n'
+            '    <\x7foo\x7f\u2581DSML\u2581parameter\x7f name="max_results">5</\x7foo\x7f\u2581DSML\u2581parameter>\n'
+            "  </\x7foo\x7f\u2581DSML\u2581invoke\x7f>\n"
+            "</\x7foo\x7f\u2581DSML\u2581tool_calls\x7f>"
+        )
+        calls = app.parse_tool_calls_from_output(markup, tools, policy)
+        self.assertEqual(1, len(calls))
+        self.assertEqual("ToolSearch", calls[0].name)
+        self.assertEqual({"query": "select:WebFetch", "max_results": 5}, calls[0].arguments)
+        # finalize must not raise, and the markup must not leak into the answer.
+        request = app.ProtocolRequest(
+            surface="openai_chat", response_model="glm-5.3", options=app.ChatOptions(),
+            stream=True, messages=[], context_text="", execution_prompt="", files=[],
+            tools=tools, tool_choice=policy, context_as_file=False,
+        )
+        turn = app.finalize_protocol_turn(request, "前置说明。" + markup, "")
+        self.assertEqual(["ToolSearch"], [call.name for call in turn.tool_calls])
+        self.assertNotIn("DSML", turn.text)
+        self.assertNotIn("<tool_calls", turn.text)
+        # The real-time filter must capture the call without leaking markup.
+        stream = app.RealtimeToolCallStream(tools, policy)
+        leaked: list[str] = []
+        stream_calls: list[object] = []
+        for offset in range(0, len("前置说明。" + markup), 5):
+            for kind, value in stream.feed(("前置说明。" + markup)[offset : offset + 5]):
+                if kind == "text":
+                    leaked.append(str(value))
+                else:
+                    stream_calls.append(value)
+        for kind, value in stream.finish():
+            if kind == "text":
+                leaked.append(str(value))
+            else:
+                stream_calls.append(value)
+        self.assertFalse(stream.malformed)
+        self.assertEqual("前置说明。", "".join(leaked))
+        self.assertEqual(1, len(stream_calls))
+
+    def test_observed_claude_bare_tool_call_remains_are_salvaged(self) -> None:
+        # Real GLM output dropped the DSML shell and emitted a Claude-style
+        # ``<tool_call>Skill`` with a bare ``args>`` value, a ``</Skill>`` pseudo
+        # close, and a fused ``</arg_value>skill<![CDATA[...]]`` pair. These used
+        # to raise ToolCallFormatError and abort the streaming turn.
+        tools = [
+            {
+                "name": "Skill",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"skill": {"type": "string"}, "args": {"type": "string"}},
+                    "required": ["skill"],
+                },
+            }
+        ]
+        policy = app.ToolChoice(mode="auto")
+        fused = (
+            "<tool_call>Skill\n"
+            "args<![CDATA[打开 Blender 并完成 Q 版狼兽人 3D 建模,导出 .blend/.obj/渲染图到 D:/Models/]]>\n"
+            "</Skill>\n"
+            "</arg_value>skill<![CDATA[computer-use]]>\n"
+            "</arg_value>Skill>"
+        )
+        calls = app.parse_tool_calls_from_output(fused, tools, policy)
+        self.assertEqual(1, len(calls))
+        self.assertEqual("Skill", calls[0].name)
+        self.assertEqual("computer-use", calls[0].arguments["skill"])
+        self.assertIn("Blender", calls[0].arguments["args"])
+        request = app.ProtocolRequest(
+            surface="openai_chat", response_model="glm-5.3", options=app.ChatOptions(),
+            stream=True, messages=[], context_text="", execution_prompt="", files=[],
+            tools=tools, tool_choice=policy, context_as_file=False,
+        )
+        turn = app.finalize_protocol_turn(request, "前置说明。" + fused, "")
+        self.assertEqual(["Skill"], [call.name for call in turn.tool_calls])
+        # The recovered block must be stripped whole; its values must not leak.
+        self.assertNotIn("computer-use", turn.text)
+        self.assertNotIn("</Skill>", turn.text)
+        self.assertNotIn("</arg_value>", turn.text)
+
+    def test_observed_claude_think_truncated_parameter_is_cleaned(self) -> None:
+        # A parameter cut off by a stray ``</think>`` must yield the clean value,
+        # not absorb the following ``<parameter>`` fragment into the argument.
+        tools = [
+            {
+                "name": "Skill",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"skill": {"type": "string"}, "args": {"type": "string"}},
+                    "required": ["skill"],
+                },
+            }
+        ]
+        policy = app.ToolChoice(mode="auto")
+        markup = (
+            "<tool_call>Skill\n"
+            "args><![CDATA[Open Blender and build a chibi wolf]]></args>\n"
+            '<parameter name="skill">computer-use:computer-use</think>'
+            '    <parameter name="skill"><![CDATA[computer-use:computer-use]]></|DSML|parameter>\n'
+            "  <|DSML|invoke>\n</|DSML|tool_calls>"
+        )
+        calls = app.parse_tool_calls_from_output(markup, tools, policy)
+        self.assertEqual(1, len(calls))
+        self.assertEqual("Skill", calls[0].name)
+        self.assertEqual("computer-use:computer-use", calls[0].arguments["skill"])
+        self.assertNotIn("<parameter", str(calls[0].arguments["skill"]))
+        self.assertNotIn("</think>", str(calls[0].arguments["skill"]))
+
     def test_context_compaction_strips_tools_and_uses_summary_prompt(self) -> None:
         instruction = (
             "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
