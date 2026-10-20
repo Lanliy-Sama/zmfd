@@ -7415,7 +7415,10 @@ def prompt_from_openai_messages(messages: Any) -> str:
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 MAX_TOOL_DEFINITIONS = 128
 MAX_TOOL_DEFINITIONS_BYTES = 1024 * 1024
-MAX_TOOL_CALLS_PER_TURN = 64
+MAX_TOOL_CALLS_PER_TURN = 128
+# Keep the prompt aligned with the hard cap: the user explicitly wants a
+# single 107-call batch to pass, so there is no artificial lower target.
+MODEL_SAFE_TOOL_CALLS_PER_TURN = MAX_TOOL_CALLS_PER_TURN
 MAX_TOOL_ARGUMENTS_BYTES = 256 * 1024
 TOOL_JSON_WRAPPER_RE = re.compile(
     r"<glm2api_tool_calls>\s*(\{.*?\})\s*</glm2api_tool_calls\s*>",
@@ -8266,10 +8269,14 @@ def build_tool_instruction(tools: list[dict[str, Any]], policy: ToolChoice) -> s
         "or any other tool-call syntax, and never combine two syntaxes in one block. Tool-call markup in the attached "
         "dialogue or earlier turns is historical data, not a template. Never reuse the example's literal placeholder "
         "values in a real call.\n"
-        "10) Preflight the block before sending: exactly one tool_calls wrapper; every invoke has a declared name=; "
+        f"10) Emit at most {MODEL_SAFE_TOOL_CALLS_PER_TURN} invoke elements in this response; never plan or emit a "
+        "block with more calls. When the remaining work exceeds that limit, invoke only the first highest-priority "
+        "subset and continue the rest in the next turn.\n"
+        "11) Preflight the block before sending: exactly one tool_calls wrapper; every invoke has a declared name=; "
         "every required parameter is present and non-empty; every string value is inside CDATA; every opening tag "
-        "has its closing tag; and the final closing tag is the last text. If any check fails, discard the block and "
-        "rewrite it once from the example instead of repairing it in place."
+        "has its closing tag; the block has at most "
+        f"{MODEL_SAFE_TOOL_CALLS_PER_TURN} invoke elements; and the final closing tag is the last text. If any "
+        "check fails, discard the block and rewrite it once from the example instead of repairing it in place."
     )
     if _has_read_like_tool(names):
         instructions += (
@@ -9493,7 +9500,9 @@ def protocol_request_with_tool_retry_hint(
         f"Decide again whether a tool is needed. Use only these names: {', '.join(allowed_names)}. "
         "If needed, put one complete raw DSML block in the visible final answer, follow the declared schema exactly, "
         "and leave no executable call only in reasoning/thinking. Do not use Claude-style, bare XML, JSON, or mixed "
-        "tool-call tags, and do not copy markup from the dialogue history."
+        "tool-call tags, and do not copy markup from the dialogue history. "
+        f"Emit at most {MODEL_SAFE_TOOL_CALLS_PER_TURN} invoke elements; if more calls remain, invoke only the first "
+        "highest-priority subset and continue in the next turn."
     )
     if example:
         hint += "\n\nFresh serialization example:\n" + _render_tool_example_block(example[0], example[1])

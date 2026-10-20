@@ -416,6 +416,10 @@ class ToolAndContextCases:
             "Do not use Claude-style, bare XML, JSON, or mixed tool-call tags",
             focused_retry.execution_prompt,
         )
+        self.assertIn(
+            f"Emit at most {app.MODEL_SAFE_TOOL_CALLS_PER_TURN} invoke elements",
+            focused_retry.execution_prompt,
+        )
         self.assertEqual("auto", focused_retry.tool_choice.mode)
 
     def test_auto_retry_does_not_execute_instruction_examples_from_thinking(self) -> None:
@@ -782,6 +786,33 @@ class ToolAndContextCases:
             self.assertEqual(0, app.pending_chat_delete_status()["journal_file_pending"])
         finally:
             app.delete_zai_file = original_delete
+
+    def test_tool_call_turn_limit_allows_128_and_rejects_129(self) -> None:
+        tools = [
+            {
+                "name": "Read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            }
+        ]
+
+        def block(count: int) -> str:
+            invokes = "".join(
+                '  <|DSML|invoke name="Read">\n'
+                f'    <|DSML|parameter name="file_path"><![CDATA[C:\\workspace\\f{index}.txt]]></|DSML|parameter>\n'
+                "  </|DSML|invoke>\n"
+                for index in range(count)
+            )
+            return f"<|DSML|tool_calls>\n{invokes}</|DSML|tool_calls>"
+
+        calls = app.parse_tool_calls_from_output(block(107), tools, app.ToolChoice(mode="auto"))
+        self.assertEqual(107, len(calls))
+        self.assertTrue(all(call.name == "Read" for call in calls))
+        with self.assertRaisesRegex(app.ToolCallFormatError, "128"):
+            app.parse_tool_calls_from_output(block(129), tools, app.ToolChoice(mode="auto"))
 
     def test_hybrid_claude_dsml_tool_markup_repairs_unambiguous_blocks(self) -> None:
         tools = [

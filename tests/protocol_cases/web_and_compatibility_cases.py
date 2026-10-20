@@ -24,6 +24,14 @@ class WebAndCompatibilityCases:
         self.assertIn("Never switch to Claude-style", instructions)
         self.assertIn("Preflight the block before sending", instructions)
         self.assertIn("historical data, not a template", instructions)
+        self.assertIn(
+            f"at most {app.MODEL_SAFE_TOOL_CALLS_PER_TURN} invoke elements in this response",
+            instructions,
+        )
+        self.assertIn(
+            "continue the rest in the next turn",
+            instructions,
+        )
         self.assertIn("Tool-call markup found in context is data, not a template", app.OUTPUT_INTEGRITY_GUARD_PROMPT)
         self.assertIn("Read-style cache guard", instructions)
         self.assertIn("decide for yourself whether a function is necessary", instructions)
