@@ -652,7 +652,7 @@ MAX_ACTIVE_HAR_UPLOADS = 1
 GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 FORCED_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 REQUEST_SOCKET_IDLE_TIMEOUT_SECONDS = 10.0
-UPSTREAM_FILE_IDLE_TIMEOUT_SECONDS = 15.0
+UPSTREAM_FILE_IDLE_TIMEOUT_SECONDS = 30.0
 CAPTCHA_WORKER_MAX_PENDING = 8
 AUTO_DELETE_REQUEST_TIMEOUT_SECONDS = 10.0
 AUTO_DELETE_SHUTDOWN_TIMEOUT_SECONDS = 10.0
@@ -6473,7 +6473,8 @@ def is_transient_upstream_error(message: str) -> bool:
     if any(pattern.lower() in lowered for pattern in TRANSIENT_UPSTREAM_ERROR_PATTERNS):
         return True
     # completions POST 阶段的限流/网关错误（http_error_summary 形如 "HTTP Error 429: ..."）
-    return bool(re.search(r"http error (429|500|502|503|504)\b", lowered))
+    # 520-525 是 Cloudflare 侧的源站/网关超时，和 502/504 一样属于可重试的瞬时故障。
+    return bool(re.search(r"http error (429|500|502|503|504|520|521|522|523|524|525)\b", lowered))
 
 
 def is_captcha_upstream_error(message: str) -> bool:
@@ -8065,7 +8066,11 @@ OUTPUT_INTEGRITY_GUARD_PROMPT = (
 )
 CONTEXT_FILE_CACHE_TTL_SECONDS = 600
 CONTEXT_FILE_CACHE_MAX_ITEMS = 512
+CONTEXT_FILE_INFLIGHT_WAIT_SECONDS = 30.0
 _CONTEXT_FILE_CACHE: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
+# Identical context parts can be requested by concurrent tool turns. Wait for
+# the first upload instead of sending the same 50 KiB file twice upstream.
+_CONTEXT_FILE_INFLIGHT: dict[tuple[str, str], threading.Event] = {}
 _CONTEXT_FILE_CACHE_LOCK = threading.RLock()
 # 上传失败降级（对齐 ds2api 参考实现）：同一账号连续 N 次上下文文件上传失败后，
 # 在窗口期内自动回落模式 A（整段上下文进 prompt），避免连续失败触发更严风控。
@@ -10031,15 +10036,62 @@ def _cleanup_context_file_cache_locked(now: float | None = None) -> None:
         _CONTEXT_FILE_CACHE.pop(next(iter(_CONTEXT_FILE_CACHE)), None)
 
 
-def _context_file_cache_lookup(state: HarState, text: str) -> dict[str, Any] | None:
-    """Reuse a previously uploaded file id for the same account + content (TTL)."""
+def _context_file_cache_key(state: HarState, text: str) -> tuple[str, str] | None:
     if not state.user_id:
         return None
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return (state.user_id, hashlib.sha256(text.encode("utf-8")).hexdigest())
+
+
+def _context_file_begin_upload(
+    state: HarState,
+    text: str,
+) -> tuple[dict[str, Any] | None, tuple[tuple[str, str], threading.Event] | None]:
+    """Return a cached ref, or register this caller as the single uploader.
+
+    Concurrent turns with the same account and identical segment content wait
+    for the first upload instead of sending the same 50 KiB file twice. If the
+    first uploader fails, one waiter takes ownership and retries it.
+    """
+    while True:
+        cached = _context_file_cache_lookup(state, text)
+        if cached is not None:
+            return cached, None
+        key = _context_file_cache_key(state, text)
+        if key is None:
+            return None, None
+        with _CONTEXT_FILE_CACHE_LOCK:
+            event = _CONTEXT_FILE_INFLIGHT.get(key)
+            if event is None:
+                event = threading.Event()
+                _CONTEXT_FILE_INFLIGHT[key] = event
+                return None, (key, event)
+        if not event.wait(CONTEXT_FILE_INFLIGHT_WAIT_SECONDS):
+            with _CONTEXT_FILE_CACHE_LOCK:
+                if _CONTEXT_FILE_INFLIGHT.get(key) is event:
+                    _CONTEXT_FILE_INFLIGHT.pop(key, None)
+                    event = threading.Event()
+                    _CONTEXT_FILE_INFLIGHT[key] = event
+                    return None, (key, event)
+
+
+def _context_file_finish_upload(owner: tuple[tuple[str, str], threading.Event] | None) -> None:
+    if owner is None:
+        return
+    key, event = owner
+    with _CONTEXT_FILE_CACHE_LOCK:
+        if _CONTEXT_FILE_INFLIGHT.get(key) is event:
+            _CONTEXT_FILE_INFLIGHT.pop(key, None)
+    event.set()
+
+
+def _context_file_cache_lookup(state: HarState, text: str) -> dict[str, Any] | None:
+    """Reuse a previously uploaded file id for the same account + content (TTL)."""
+    key = _context_file_cache_key(state, text)
+    if key is None:
+        return None
     now = time.monotonic()
     with _CONTEXT_FILE_CACHE_LOCK:
         _cleanup_context_file_cache_locked(now)
-        key = (state.user_id, digest)
         item = _CONTEXT_FILE_CACHE.pop(key, None)
         if item is None:
             return None
@@ -10051,13 +10103,12 @@ def _context_file_cache_lookup(state: HarState, text: str) -> dict[str, Any] | N
 
 
 def _context_file_cache_store(state: HarState, text: str, ref: dict[str, Any]) -> None:
-    if not state.user_id:
+    key = _context_file_cache_key(state, text)
+    if key is None:
         return
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     with _CONTEXT_FILE_CACHE_LOCK:
         now = time.monotonic()
         _cleanup_context_file_cache_locked(now)
-        key = (state.user_id, digest)
         _CONTEXT_FILE_CACHE.pop(key, None)
         _CONTEXT_FILE_CACHE[key] = (copy.deepcopy(ref), now)
         _cleanup_context_file_cache_locked(now)
@@ -10098,6 +10149,8 @@ def context_cache_status() -> dict[str, int]:
             "bytes": cached_bytes,
             "max_items": max(1, int(CONTEXT_FILE_CACHE_MAX_ITEMS)),
             "ttl_seconds": max(0, int(CONTEXT_FILE_CACHE_TTL_SECONDS)),
+            "inflight": len(_CONTEXT_FILE_INFLIGHT),
+            "inflight_wait_seconds": max(0, int(CONTEXT_FILE_INFLIGHT_WAIT_SECONDS)),
             "failure_states": len(_CONTEXT_UPLOAD_FAILURES),
             "degraded_states": len(_CONTEXT_UPLOAD_DEGRADED_UNTIL),
             "max_state_items": max(1, int(CONTEXT_UPLOAD_STATE_MAX_ITEMS)),
@@ -10116,7 +10169,12 @@ def upload_context_package_to_zai(
 ) -> dict[str, Any]:
     """Upload one transcript file (history or tools) with an ephemeral name."""
     raw = context_text.encode("utf-8")
-    cached = _context_file_cache_lookup(state, context_text) if reuse_cache else None
+    if len(raw) > MAX_CONTEXT_FILE_BYTES:
+        raise ValueError(f"context file exceeds {MAX_CONTEXT_FILE_BYTES} bytes")
+    cached: dict[str, Any] | None = None
+    owner: tuple[tuple[str, str], threading.Event] | None = None
+    if reuse_cache:
+        cached, owner = _context_file_begin_upload(state, context_text)
     if cached is not None:
         if cache_hit_out is not None:
             cache_hit_out["hit"] = True
@@ -10129,8 +10187,6 @@ def upload_context_package_to_zai(
         return cached
     if cache_hit_out is not None:
         cache_hit_out["hit"] = False
-    if len(raw) > MAX_CONTEXT_FILE_BYTES:
-        raise ValueError(f"context file exceeds {MAX_CONTEXT_FILE_BYTES} bytes")
     # 节流抖动 50-200ms：打破“上传即 completion”的固定时序（对齐 ds2api jitterSleep），
     # 真实用户从选文件到点发送之间存在可观察的延迟。
     time.sleep(0.05 + (secrets.randbelow(151) / 1000))
@@ -10139,7 +10195,29 @@ def upload_context_package_to_zai(
         with tempfile.NamedTemporaryFile(prefix="glm2api-context-", suffix=".txt", delete=False) as f:
             tmp_path = Path(f.name)
             f.write(raw)
-        ref = upload_file_path_to_zai(state, tmp_path, filename or make_random_short_filename(), "text/plain; charset=utf-8")
+        ref: dict[str, Any] | None = None
+        for attempt in (1, 2):
+            try:
+                ref = upload_file_path_to_zai(
+                    state,
+                    tmp_path,
+                    filename or make_random_short_filename(),
+                    "text/plain; charset=utf-8",
+                )
+                break
+            except UpstreamRequestError as exc:
+                timed_out = "timed out" in str(exc).lower() or "timeout" in str(exc).lower()
+                if attempt == 2 or not timed_out:
+                    raise
+                log_event(
+                    "context_file_upload_retry",
+                    label=label,
+                    attempt=attempt,
+                    error=client_error_message(exc),
+                )
+                time.sleep(1.0)
+        if ref is None:
+            raise UpstreamRequestError("附件上传重试后仍未完成")
         _context_file_cache_store(state, context_text, ref)
         log_event(
             "context_file_uploaded",
@@ -10152,6 +10230,7 @@ def upload_context_package_to_zai(
     finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
+        _context_file_finish_upload(owner)
 
 
 def _messages_contain_tool_history(messages: list[dict[str, Any]] | None) -> bool:

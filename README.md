@@ -86,7 +86,7 @@ Web UI 是控制台式布局：左侧导航 + 顶栏状态，共八页——「�
 - 独立「统计」页基于已保留的请求镜像聚合成功/错误/停止、耗时分位数、历史拆分占比、Token 构成、模型排行和调用入口；请求镜像还提供工具回合数、原生调用数、格式纠错请求/成功率与 thinking 恢复次数，且不会把提示词、回复、工具参数、账号 ID 或错误正文带入统计响应。
 - 统计页可把当前时间窗口导出为带版本标识的 JSON；导出内容与 `/api/metrics` 一致，仅含脱敏聚合值，便于留档和离线比较。
 - 运行态计数器只统计真实业务/管理请求，忽略 `/api/status`、`/api/logs`、`/api/metrics` 等面板轮询，提供本次进程 HTTP 总量、4xx/5xx（单列 408 请求体超时与 413 正文超限）、近 5 分钟请求数、真实 handler P50/P95 和当前并发。路径计数最多保留 256 个槽位、单个路径最多 300 字符；继续出现的新路径统一进入 `/:other` 并累计 `path_overflow_total`，随机 URL 探测不会让 Counter 永久增长。
-- `GET /api/metrics?hours=24` 返回 `runtime`、`history`、`logs` 三组聚合值；`history.tools` 是脱敏工具链健康度，`runtime.upstream_readers` 提供阻塞读取线程的活跃/峰值、静默轮询、错误和强制关闭计数，`runtime.sse_heartbeat` 提供下游心跳线程与实际发送/错误计数，`runtime.captcha_worker` 提供浏览器验证码回退队列的线程、活跃、积压和回压状态，`runtime.context_cache` 提供上下文附件缓存和上传失败/降级状态占用，`runtime.upload_slots` 提供附件/HAR 上传的活跃、峰值与累计回压，`runtime.upstream_responses` 提供非流式响应拒绝、错误正文截断，以及整次流式原始事件/语义输出/事件数的拒绝计数；`hours` 支持 1–720，面板常用 1 / 24 / 168。
+- `GET /api/metrics?hours=24` 返回 `runtime`、`history`、`logs` 三组聚合值；`history.tools` 是脱敏工具链健康度，`runtime.upstream_readers` 提供阻塞读取线程的活跃/峰值、静默轮询、错误和强制关闭计数，`runtime.sse_heartbeat` 提供下游心跳线程与实际发送/错误计数，`runtime.captcha_worker` 提供浏览器验证码回退队列的线程、活跃、积压和回压状态，`runtime.context_cache` 提供上下文附件缓存、并发同内容上传的 inflight 等待和上传失败/降级状态占用，`runtime.upload_slots` 提供附件/HAR 上传的活跃、峰值与累计回压，`runtime.upstream_responses` 提供非流式响应拒绝、错误正文截断，以及整次流式原始事件/语义输出/事件数的拒绝计数；`hours` 支持 1–720，面板常用 1 / 24 / 168。
 
 - 整次上游 SSE 采用三重硬预算：原始事件累计 32 MiB、解析后的正文与思考累计 16 MiB、最多 100,000 个事件。核心上游读取与 OpenAI Chat、Responses、Anthropic 适配出口独立校验；超过预算会关闭上游流、按上游响应异常返回/发送协议错误、清理本次会话并把历史标记为失败，不会把半截工具标记当作有效调用。历史实时镜像只累计其实际会保留的回答 30,000 字符和思考 20,000 字符，避免每 750ms 对完整长输出反复拼接。
 - **显式流完成判定**：依据网页抓包中的两类真实终止帧，只有收到 `data.done=true` 或 `[DONE]` 才把上游 SSE 记为成功。无正文时提前 EOF 可换新 chat 有界重试；已有正文时提前 EOF 不会重放造成重复内容，而是返回上游中断、把历史标为 error，并无视正常完成后的保留开关登记该半截 chat 删除。`runtime.upstream_responses.stream_incomplete_total` 记录此类连接。网页自身也必须收到本地 `done`：网络中断时保留已显示的部分回答并以 `incomplete` 标记存入本地会话，后续作为历史发送时会附带“仅保留部分内容”的说明。
@@ -207,7 +207,7 @@ profiles.local.json
 - 仅当回答尚未输出任何内容（流首错误）且本次调用自建会话时重试：删除被中断的空会话 → 等待 → 新建会话重发；对客户端完全透明，错误不透传。
 - 默认等待 **3 秒**、最多尝试 **3 次**；可在面板「设置」页调整"繁忙重试等待（秒）"（0–120）与"繁忙重试次数上限"（1–6），保存到 `settings.local.json`。
 - 复用会话（continue/reuse）模式不内部重试（换会话会破坏"保持当前会话 ID"语义），错误原样透传。
-- 可重试错误：`MODEL_CONCURRENCY_LIMIT`、繁忙/限流类关键词、实测创建 chat 阶段的“上游中断”、HTTP 429/500/502/503/504，以及**验证码被上游拒绝**（`FRONTEND_CAPTCHA_REQUIRED` F018/F019，见下文验证码时效）。所有重试都限定在尚未向客户端输出回答时；鉴权、内容审核类错误及已开始的回答一律原样结束，不做内部重放。
+- 可重试错误：`MODEL_CONCURRENCY_LIMIT`、繁忙/限流类关键词、实测创建 chat 阶段的“上游中断”、HTTP 429/500/502/503/504/520–525，以及**验证码被上游拒绝**（`FRONTEND_CAPTCHA_REQUIRED` F018/F019，见下文验证码时效）。所有重试都限定在尚未向客户端输出回答时；鉴权、内容审核类错误及已开始的回答一律原样结束，不做内部重放。
 - **验证码失效重试不等待**：繁忙类错误等待 `wait_sec` 再试；验证码类错误无需等待（验证码是一次性凭据，不存在"繁忙"），立即换会话并**强制现场重解**（绕开验证码池与降级缓存，日志 `fresh_captcha_ready` 带 `force_fresh: true`）。
 - 内部重试耗尽后的错误按协议规范返回，让客户端 SDK 走标准退避而非把 500 当未知故障：OpenAI 面 `503 server_error`、Anthropic 面 `529 overloaded_error`，均带 `Retry-After: 3`；Anthropic 流式错误事件同样标记 `overloaded_error`。
 - 相关日志事件：`upstream_transient_retry`（attempt/wait_sec/error/reason）、`retry_cleanup_delete_error`（清理失败）。
@@ -242,7 +242,7 @@ profiles.local.json
 - **大上传独立回压**：附件落盘/上游上传最多同时 4 个，HAR 导入最多同时 1 个，与 128 个通用 HTTP handler 分开计数；超出时在读取正文前返回 429 `upload_capacity_busy`、`Retry-After: 2` 并关闭当前连接，避免未消费正文污染 keep-alive 请求边界。原始 HAR 仍可流式上传至 512 MiB，旧版 `application/json` 包装 HAR 因需整包驻留内存而限制为 64 MiB。状态页与 `runtime.upload_slots` 可查看附件/HAR 当前占用、峰值及拒绝次数。
 - **请求体 framing**：JSON、HAR 和附件上传同时支持 `Content-Length` 与 HTTP/1.1 `Transfer-Encoding: chunked`。chunked 正文逐块执行总量限制，文件上传逐块写临时文件；chunk size 行最多 128 字节、trailer 总量最多 8 KiB。为避免边界歧义，`Content-Length + Transfer-Encoding`、重复 Content-Length、未知 transfer coding、畸形分块明确返回 400；超过路由正文预算则统一返回 413 `request_too_large` 并关闭连接，OpenAI/Anthropic/网页管理错误包保持各自协议形状。生成协议入口（OpenAI Chat/Responses、Anthropic Messages、面板 `/api/chat` 与 `count_tokens`）的 JSON 正文预算为 **32 MiB**，足以容纳约百万 token 的原始上下文；设置、账号、日志和历史管理等非生成入口仍保持 2 MiB。
 - **上游非流响应有界化**：创建/浏览/删除会话等 JSON 响应最多读取 32 MiB，上游错误正文最多读取 64 KiB，附件上传响应最多读取 1 MiB。超过预算会立即关闭上游响应、记录 `upstream_response_too_large`，并以 502 暴露为上游故障；超长错误正文只保留安全摘要并计入 `runtime.upstream_responses.error_truncated_total`，不会整包进入内存或日志。附件上传的上游连接/响应异常同样返回 502 `upstream_upload_error`，不再误报为客户端 400。
-- **有界优雅关闭**：Ctrl+C 后先关闭监听并设置全局 shutdown event，现有 handler 有 15 秒自然收束；仍未结束时尽力中断活跃客户端 socket，再等待 5 秒。OpenAI/Responses/Anthropic/网页生成会在每个上游 chunk、空闲心跳、验证码阶段和繁忙退避中检查该事件，状态记为 `stopped`，中断 chat 以 `service_shutdown` 原因进入删除 journal/队列；用户附件上传也在每个 multipart 分片间检查，且上游文件连接 idle timeout 为 15 秒。happy-dom 改用受控 `Popen`，关闭时会终止 Node helper；验证码预热线程被跟踪并在 handler 排空前取消。最后停止接收新的自动删除任务并最多等待 10 秒，未开始的任务安全取消、留待下次启动补偿。
+- **有界优雅关闭**：Ctrl+C 后先关闭监听并设置全局 shutdown event，现有 handler 有 15 秒自然收束；仍未结束时尽力中断活跃客户端 socket，再等待 5 秒。OpenAI/Responses/Anthropic/网页生成会在每个上游 chunk、空闲心跳、验证码阶段和繁忙退避中检查该事件，状态记为 `stopped`，中断 chat 以 `service_shutdown` 原因进入删除 journal/队列；用户附件上传也在每个 multipart 分片间检查，且上游文件连接 idle timeout 为 30 秒，单次上传超时后会自动重试一次。happy-dom 改用受控 `Popen`，关闭时会终止 Node helper；验证码预热线程被跟踪并在 handler 排空前取消。最后停止接收新的自动删除任务并最多等待 10 秒，未开始的任务安全取消、留待下次启动补偿。
 - **繁忙重试覆盖会话创建**：`POST /api/v1/chats/new` 阶段的 429/5xx 瞬时错误同样进入"等待后重试"循环（日志 `upstream_transient_retry` 带 `stage=new_chat`）。
 - **删除 404 视为成功**：会话已不存在（创建即被拒/已删除）不再报 `failed_chat_cleanup_error` 噪音。
 - **429 限流响应**：本地并发槽满时返回的 429 带 `Retry-After: 3` 头，客户端（如 Claude Code）可据此退避。

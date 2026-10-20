@@ -228,6 +228,40 @@ class WebAndCompatibilityCases:
             app._CONTEXT_FILE_CACHE.clear()
             app._CONTEXT_FILE_CACHE.update(previous_cache)
 
+    def test_context_file_inflight_upload_deduplicates_identical_parts(self) -> None:
+        state = fake_state()
+        previous_cache = dict(app._CONTEXT_FILE_CACHE)
+        previous_inflight = dict(app._CONTEXT_FILE_INFLIGHT)
+        text = "shared context part"
+        result: dict[str, object] = {}
+        try:
+            app._CONTEXT_FILE_CACHE.clear()
+            app._CONTEXT_FILE_INFLIGHT.clear()
+            cached, owner = app._context_file_begin_upload(state, text)
+            self.assertIsNone(cached)
+            self.assertIsNotNone(owner)
+
+            def wait_for_first_upload() -> None:
+                result["cached"], result["owner"] = app._context_file_begin_upload(state, text)
+
+            waiter = threading.Thread(target=wait_for_first_upload)
+            waiter.start()
+            time.sleep(0.1)
+            self.assertTrue(waiter.is_alive(), "并发请求应等待第一个上传完成")
+
+            app._context_file_cache_store(state, text, {"id": "shared-file", "meta": {"size": len(text)}})
+            app._context_file_finish_upload(owner)
+            waiter.join(timeout=2)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual("shared-file", result["cached"]["id"])
+            self.assertIsNone(result["owner"])
+            self.assertEqual({}, app._CONTEXT_FILE_INFLIGHT)
+        finally:
+            app._CONTEXT_FILE_CACHE.clear()
+            app._CONTEXT_FILE_CACHE.update(previous_cache)
+            app._CONTEXT_FILE_INFLIGHT.clear()
+            app._CONTEXT_FILE_INFLIGHT.update(previous_inflight)
+
     def test_context_file_delete_journal_invalidates_cached_file_ref(self) -> None:
         state = fake_state()
         previous_cache = dict(app._CONTEXT_FILE_CACHE)

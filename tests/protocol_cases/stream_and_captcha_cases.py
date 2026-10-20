@@ -9,6 +9,8 @@ class StreamAndCaptchaCases:
         self.assertTrue(app.is_transient_upstream_error(busy))
         self.assertTrue(app.is_transient_upstream_error("HTTP Error 429: too many requests"))
         self.assertTrue(app.is_transient_upstream_error("HTTP Error 502: bad gateway"))
+        self.assertTrue(app.is_transient_upstream_error("HTTP Error 520: unknown origin error"))
+        self.assertTrue(app.is_transient_upstream_error("HTTP Error 524: Origin Time-out"))
         self.assertTrue(app.is_transient_upstream_error("上游中断"))
         self.assertFalse(app.is_transient_upstream_error("AUTH_REQUIRED: unauthorized"))
         self.assertFalse(app.is_transient_upstream_error("FRONTEND_CAPTCHA_REQUIRED: missing captcha"))
