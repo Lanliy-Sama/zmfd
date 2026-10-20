@@ -10513,7 +10513,7 @@ def preload_zai_context_waves(
                 retry_files_factory=retry_files,
                 preserve_chat_on_generator_close=True,
             )
-            thinking_started = False
+            semantic_started = False
             phase_seen = ""
             try:
                 for event in events:
@@ -10524,7 +10524,11 @@ def preload_zai_context_waves(
                     if not delta:
                         continue
                     phase_seen = phase.lower()
-                    thinking_started = phase_seen == "thinking"
+                    # Thinking is the official preload signal, but a model may
+                    # start the answer phase directly after reading the batch.
+                    # Either semantic delta proves the attachments were consumed;
+                    # stop the turn and continue instead of failing the request.
+                    semantic_started = phase_seen in {"thinking", "answer"}
                     break
                 assistant_id = str(context.get("assistant_message_id") or "").strip()
                 active_chat_id = str(context.get("chat_id") or chat_id or "").strip()
@@ -10540,8 +10544,17 @@ def preload_zai_context_waves(
                     files=len(initial_files),
                     phase=phase_seen or "none",
                 )
-                if not thinking_started:
-                    raise UpstreamRequestError("context preload did not enter the thinking phase")
+                if not semantic_started:
+                    raise UpstreamRequestError("context preload did not produce a semantic delta")
+                if phase_seen == "answer":
+                    log_event(
+                        "context_preload_answered_early",
+                        chat_id_fp=sha16(active_chat_id),
+                        assistant_id_fp=sha16(assistant_id),
+                        wave=index,
+                        waves=total,
+                        files=len(initial_files),
+                    )
                 chat_id = active_chat_id
                 parent_message_id = assistant_id
             finally:

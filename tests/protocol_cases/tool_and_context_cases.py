@@ -1530,6 +1530,43 @@ class ToolAndContextCases:
         self.assertIn("Do not answer", calls[0]["prompt"])
         self.assertEqual(2, len(stopped))
 
+    def test_context_preload_accepts_early_answer_phase(self) -> None:
+        state = fake_state()
+        original_stream = app.stream_zai_completion
+        original_stop = app.stop_zai_task
+        original_cleanup = app._best_effort_delete_upstream_files
+        chat_id = "00000000-0000-0000-0000-000000000451"
+        stopped: list[str] = []
+
+        def answer_stream(_state, _prompt, **kwargs):
+            context = kwargs["context_out"]
+            context.update(
+                {
+                    "chat_id": kwargs.get("chat_id") or chat_id,
+                    "assistant_message_id": "00000000-0000-0000-0000-000000000452",
+                }
+            )
+            yield 'data: {"data":{"delta_content":"early answer","phase":"answer"}}'
+            raise AssertionError("preload must close the stream after the first semantic delta")
+
+        app.stream_zai_completion = answer_stream
+        app.stop_zai_task = lambda _state, assistant_id: stopped.append(assistant_id) or {"status": True}
+        app._best_effort_delete_upstream_files = lambda *_args, **_kwargs: True
+        try:
+            result_chat, result_parent = app.preload_zai_context_waves(
+                state,
+                [([], [{"kind": "history", "part": 1, "parts": 1, "content": "context"}])],
+                app.ChatOptions(model="glm-5.3"),
+            )
+        finally:
+            app.stream_zai_completion = original_stream
+            app.stop_zai_task = original_stop
+            app._best_effort_delete_upstream_files = original_cleanup
+
+        self.assertEqual(chat_id, result_chat)
+        self.assertEqual(stopped[-1], result_parent)
+        self.assertEqual(1, len(stopped))
+
     def test_har_aligned_preload_chain_retries_second_wave_on_same_parent(self) -> None:
         state = fake_state()
         chat_id = "00000000-0000-0000-0000-000000000431"
