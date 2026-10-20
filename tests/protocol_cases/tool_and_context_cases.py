@@ -962,6 +962,66 @@ class ToolAndContextCases:
         self.assertEqual("先说明一下。", "".join(malformed_text_actions))
         self.assertTrue(all("<tool_call" not in value for value in malformed_text_actions))
 
+    def test_context_compaction_strips_tools_and_uses_summary_prompt(self) -> None:
+        instruction = (
+            "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+            "- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n"
+            "- You already have all the context you need.\n"
+            "Summarize the conversation so far."
+        )
+        messages = [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": instruction + "\n" + ("history " * 5000)},
+        ]
+        body = {
+            "model": "glm-5.3",
+            "messages": messages,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "Read", "parameters": {"type": "object"}},
+                }
+            ],
+            "tool_choice": "auto",
+        }
+        request = app.normalize_openai_chat_request(body, False)
+        self.assertTrue(request.compaction)
+        self.assertEqual([], request.tools)
+        self.assertEqual("none", request.tool_choice.mode)
+        self.assertTrue(request.context_as_file)
+        self.assertIn("conversation to compact", request.execution_prompt)
+        self.assertIn("CRITICAL: Respond with TEXT ONLY", request.execution_prompt)
+        self.assertNotIn("DSML", request.execution_prompt)
+        self.assertNotIn("tool_calls", request.execution_prompt)
+
+        self.uploads = []
+        trace: dict[str, object] = {}
+        prompt, files = app.prepare_protocol_upstream_request(fake_state(), request, trace_out=trace)
+        self.assertEqual(1, len(files))
+        self.assertEqual(1, len(self.uploads))
+        self.assertIn("[user]", self.uploads[0][1])
+        self.assertIn("CRITICAL: Respond with TEXT ONLY", self.uploads[0][1])
+        self.assertNotIn("name: Read", self.uploads[0][1])
+        self.assertIn("conversation to compact", prompt)
+
+        normal = app.normalize_openai_chat_request(
+            {
+                "model": "glm-5.3",
+                "messages": [{"role": "user", "content": "read the file"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "Read", "parameters": {"type": "object"}},
+                    }
+                ],
+                "tool_choice": "auto",
+            },
+            False,
+        )
+        self.assertFalse(normal.compaction)
+        self.assertEqual(1, len(normal.tools))
+
     def test_tool_policy_and_context_file_switches(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires at least one"):
             app.normalize_openai_chat_request(

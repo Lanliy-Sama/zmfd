@@ -2711,6 +2711,7 @@ class ProtocolRequest:
     store: bool = True
     previous_response_id: str = ""
     tool_retry_active: bool = False
+    compaction: bool = False
 
 
 @dataclass
@@ -8768,14 +8769,70 @@ def apply_parallel_tool_setting(policy: ToolChoice, body: dict[str, Any]) -> Too
     return policy
 
 
+COMPACTION_PROMPT_PREFIX = (
+    "The attached files contain the conversation to compact. Read every segment in numeric header order "
+    "through its end, then follow the instructions below.\n\n"
+)
+
+
+def is_compaction_request(messages: list[dict[str, Any]]) -> bool:
+    """Detect ZCode/agent context-compaction turns.
+
+    These requests often still carry the client's tool list with
+    ``tool_choice=auto`` even though the instruction explicitly says
+    "Respond with TEXT ONLY" and "Do NOT call any tools". Injecting the DSML
+    tool contract for such a turn conflicts with the summarization task, so the
+    proxy strips tools and uses a compaction-specific final prompt.
+    """
+    for message in reversed(messages or []):
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        text = str(message.get("content") or "").strip().lower()
+        if not text:
+            continue
+        return bool(
+            text.startswith("critical: respond with text only")
+            or (
+                "respond with text only" in text
+                and "do not call any tools" in text
+            )
+            or (
+                "summarize the conversation" in text
+                and "do not call any tools" in text
+            )
+        )
+    return False
+
+
+def compaction_execution_prompt(messages: list[dict[str, Any]]) -> str:
+    """Use the client's actual compaction instruction as the final prompt."""
+    for message in reversed(messages or []):
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        text = str(message.get("content") or "").strip()
+        if text:
+            return COMPACTION_PROMPT_PREFIX + text
+    return COMPACTION_PROMPT_PREFIX + "Produce a concise plain-text summary of the conversation."
+
+
 def normalize_openai_chat_request(body: dict[str, Any], include_thinking_default: bool) -> ProtocolRequest:
     messages = normalize_openai_messages_for_protocol(body.get("messages"))
-    tools = normalize_tool_definitions(body.get("tools"), "openai_chat")
-    policy = apply_parallel_tool_setting(normalize_tool_choice(body.get("tool_choice"), tools), body)
+    compaction = is_compaction_request(messages)
+    if compaction:
+        tools: list[dict[str, Any]] = []
+        policy = ToolChoice(mode="none")
+    else:
+        tools = normalize_tool_definitions(body.get("tools"), "openai_chat")
+        policy = apply_parallel_tool_setting(normalize_tool_choice(body.get("tool_choice"), tools), body)
     options = protocol_options_from_body(body, "openai_chat", include_thinking_default)
+    if compaction:
+        options.auto_web_search = False
     context_text = build_context_package("openai_chat", messages, tools, policy)
     context_as_file = context_file_requested(body, "openai_chat", messages, tools, context_text)
-    prompt = file_mode_execution_prompt(tools, policy) if context_as_file else context_text
+    if compaction and context_as_file:
+        prompt = compaction_execution_prompt(messages)
+    else:
+        prompt = file_mode_execution_prompt(tools, policy) if context_as_file else context_text
     return ProtocolRequest(
         surface="openai_chat",
         response_model=requested_model_name(body),
@@ -8789,6 +8846,7 @@ def normalize_openai_chat_request(body: dict[str, Any], include_thinking_default
         tool_choice=policy,
         context_as_file=context_as_file,
         store=coerce_bool(body.get("store"), True),
+        compaction=compaction,
     )
 
 
@@ -8798,12 +8856,22 @@ def normalize_openai_responses_request(
     prior_messages: list[dict[str, Any]] | None = None,
 ) -> ProtocolRequest:
     messages = list(prior_messages or []) + normalize_responses_messages_for_protocol(body)
-    tools = normalize_tool_definitions(body.get("tools"), "openai_responses")
-    policy = apply_parallel_tool_setting(normalize_tool_choice(body.get("tool_choice"), tools), body)
+    compaction = is_compaction_request(messages)
+    if compaction:
+        tools: list[dict[str, Any]] = []
+        policy = ToolChoice(mode="none")
+    else:
+        tools = normalize_tool_definitions(body.get("tools"), "openai_responses")
+        policy = apply_parallel_tool_setting(normalize_tool_choice(body.get("tool_choice"), tools), body)
     options = protocol_options_from_body(body, "openai_responses", include_thinking_default)
+    if compaction:
+        options.auto_web_search = False
     context_text = build_context_package("openai_responses", messages, tools, policy)
     context_as_file = context_file_requested(body, "openai_responses", messages, tools, context_text)
-    prompt = file_mode_execution_prompt(tools, policy) if context_as_file else context_text
+    if compaction and context_as_file:
+        prompt = compaction_execution_prompt(messages)
+    else:
+        prompt = file_mode_execution_prompt(tools, policy) if context_as_file else context_text
     return ProtocolRequest(
         surface="openai_responses",
         response_model=requested_model_name(body),
@@ -8818,17 +8886,28 @@ def normalize_openai_responses_request(
         context_as_file=context_as_file,
         store=coerce_bool(body.get("store"), True),
         previous_response_id=str(body.get("previous_response_id") or "").strip(),
+        compaction=compaction,
     )
 
 
 def normalize_anthropic_messages_request(body: dict[str, Any], include_thinking_default: bool) -> ProtocolRequest:
     messages = normalize_claude_messages_for_protocol(body.get("messages"), body.get("system"))
-    tools = normalize_tool_definitions(body.get("tools"), "anthropic_messages")
-    policy = apply_parallel_tool_setting(normalize_tool_choice(body.get("tool_choice"), tools), body)
+    compaction = is_compaction_request(messages)
+    if compaction:
+        tools: list[dict[str, Any]] = []
+        policy = ToolChoice(mode="none")
+    else:
+        tools = normalize_tool_definitions(body.get("tools"), "anthropic_messages")
+        policy = apply_parallel_tool_setting(normalize_tool_choice(body.get("tool_choice"), tools), body)
     options = protocol_options_from_body(body, "anthropic_messages", include_thinking_default)
+    if compaction:
+        options.auto_web_search = False
     context_text = build_context_package("anthropic_messages", messages, tools, policy)
     context_as_file = context_file_requested(body, "anthropic_messages", messages, tools, context_text)
-    prompt = file_mode_execution_prompt(tools, policy) if context_as_file else context_text
+    if compaction and context_as_file:
+        prompt = compaction_execution_prompt(messages)
+    else:
+        prompt = file_mode_execution_prompt(tools, policy) if context_as_file else context_text
     return ProtocolRequest(
         surface="anthropic_messages",
         response_model=requested_model_name(body),
@@ -8842,6 +8921,7 @@ def normalize_anthropic_messages_request(body: dict[str, Any], include_thinking_
         tool_choice=policy,
         context_as_file=context_as_file,
         store=coerce_bool(body.get("store"), True),
+        compaction=compaction,
     )
 
 
@@ -11911,6 +11991,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             stream=request.stream,
             tools=len(request.tools),
             tool_choice=request.tool_choice.mode,
+            compaction=request.compaction,
             context_mode=str(delivery_trace.get("delivery_mode") or "inline"),
             context_mode_requested=str(delivery_trace.get("requested_mode") or "inline"),
             context_fallback=str(delivery_trace.get("fallback_reason") or ""),
