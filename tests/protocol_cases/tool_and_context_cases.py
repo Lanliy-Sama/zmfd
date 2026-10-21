@@ -92,6 +92,7 @@ class ToolAndContextCases:
             "~~~xml\n<tool_call>Bash<arg_key>command</arg_key><arg_value>pwd `x`</arg_value></tool_call>\n~~~",
             "````text\nTool: Bash\n<tool_input>{\"command\":\"pwd\"}</tool_input>\n````",
             "```xml\n<function_call>{\"name\":\"Bash\",\"arguments\":{}}</function_call>",
+            '```text\n**Calling:** Bash\n{"command":"pwd"}\n```',
         ]
         for raw in examples:
             self.assertEqual([], app.parse_tool_calls_from_output(raw, tools, app.ToolChoice()), raw)
@@ -134,7 +135,7 @@ class ToolAndContextCases:
             app.finalize_protocol_turn(request, malformed, "")
         self.assertEqual("前置后置", app.strip_parsed_tool_markup(malformed))
 
-    def test_tool_output_strict_mode_rejects_partial_or_invalid_batches(self) -> None:
+    def test_tool_output_strict_mode_salvages_valid_calls_from_partial_batches(self) -> None:
         tools = app.normalize_tool_definitions(
             [
                 {
@@ -157,8 +158,11 @@ class ToolAndContextCases:
             '{"name":"undeclared_tool","arguments":{}}]}'
             '</glm2api_tool_calls>'
         )
-        with self.assertRaisesRegex(app.ToolCallFormatError, "未声明"):
-            app.parse_tool_calls_from_output(mixed, tools, app.ToolChoice())
+        # One bad sibling must not discard the valid call: long agent turns
+        # batch several tools, and a whole-turn failure loses the task.
+        calls = app.parse_tool_calls_from_output(mixed, tools, app.ToolChoice())
+        self.assertEqual(["read_file"], [call.name for call in calls])
+        self.assertEqual("README.md", calls[0].arguments["path"])
 
         malformed_arguments = (
             '<glm2api_tool_calls>{"tool_calls":['
@@ -175,6 +179,89 @@ class ToolAndContextCases:
         )
         with self.assertRaisesRegex(app.ToolCallFormatError, "缺少必填字段: path"):
             app.parse_tool_calls_from_output(missing_required, tools, app.ToolChoice())
+
+    def test_tool_parser_flattens_nested_parameters_and_empty_required_objects(self) -> None:
+        tools = [
+            {
+                "name": "DeferredToolCall",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "input": {"type": "object", "additionalProperties": {}},
+                    },
+                    "required": ["name", "input"],
+                },
+            }
+        ]
+        text = (
+            "<|DSML|tool_calls>"
+            '<|DSML|invoke name="DeferredToolCall">'
+            '<|DSML|parameter name="name"><![CDATA[mcp__github__get_me]]></|DSML|parameter>'
+            '<|DSML|parameter name="input"></|DSML|parameter>'
+            "</|DSML|invoke>"
+            '<|DSML|invoke name="DeferredToolCall">'
+            '<|DSML|parameter name="name"><![CDATA[mcp__node_repl__js]]></|DSML|parameter>'
+            '<|DSML|parameter name="input">'
+            '<|DSML|parameter name="code"><![CDATA[console.log(1)]]></|DSML|parameter>'
+            '<|DSML|parameter name="timeout_ms">45000</|DSML|parameter>'
+            "</|DSML|parameter>"
+            "</|DSML|invoke>"
+            "</|DSML|tool_calls>"
+        )
+        calls = app.parse_tool_calls_from_output(text, tools, app.ToolChoice())
+        self.assertEqual(2, len(calls))
+        self.assertEqual({"name": "mcp__github__get_me", "input": {}}, calls[0].arguments)
+        self.assertEqual(
+            {
+                "name": "mcp__node_repl__js",
+                "input": {"code": "console.log(1)", "timeout_ms": 45000},
+            },
+            calls[1].arguments,
+        )
+
+    def test_tool_parser_unwraps_input_envelope_for_resident_tools(self) -> None:
+        tools = [
+            {
+                "name": "TodoWrite",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"todos": {"type": "array", "items": {"type": "object"}}},
+                    "required": ["todos"],
+                },
+            }
+        ]
+        text = (
+            '<|DSML|tool_calls><|DSML|invoke name="TodoWrite">'
+            '<|DSML|parameter name="input">'
+            "<todos><item><content><![CDATA[check]]></content>"
+            "<status><![CDATA[in_progress]]></status>"
+            "<priority><![CDATA[high]]></priority></item></todos>"
+            "</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"
+        )
+        calls = app.parse_tool_calls_from_output(text, tools, app.ToolChoice())
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            [{"content": "check", "status": "in_progress", "priority": "high"}],
+            calls[0].arguments["todos"],
+        )
+
+    def test_finalize_ignores_tool_markup_inside_inline_code(self) -> None:
+        request = app.normalize_openai_chat_request(
+            {
+                "model": "glm-5.2",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}],
+            },
+            False,
+        )
+        summary = (
+            '本轮格式是 `<|DSML|tool_calls>` 包住 `<|DSML|invoke name="Read">`，'
+            "参数写在 `<|DSML|parameter>` 里。"
+        )
+        turn = app.finalize_protocol_turn(request, summary, "")
+        self.assertEqual([], turn.tool_calls)
+        self.assertIn("<|DSML|tool_calls>", turn.text)
 
     def test_tool_output_limits_calls_arguments_and_definitions(self) -> None:
         tools = [{"name": "echo", "parameters": {"type": "object", "properties": {}}}]

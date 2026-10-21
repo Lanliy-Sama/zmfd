@@ -6018,7 +6018,11 @@ def stream_zai_completion(
                 except Exception as exc:
                     # 创建会话阶段同样可能撞上瞬时繁忙/限流/验证码失效。
                     if not last_attempt and is_retryable_upstream_error(str(exc)):
-                        wait_sec = 0.0 if is_captcha_upstream_error(str(exc)) else retry_wait_sec
+                        wait_sec = (
+                            0.0
+                            if is_captcha_upstream_error(str(exc))
+                            else upstream_retry_wait(retry_wait_sec, attempt)
+                        )
                         log_event(
                             "upstream_transient_retry",
                             stage="new_chat",
@@ -6108,7 +6112,11 @@ def stream_zai_completion(
                     summary=summary,
                 )
                 if not last_attempt and can_retry and is_retryable_upstream_error(summary):
-                    wait_sec = 0.0 if is_captcha_upstream_error(summary) else retry_wait_sec
+                    wait_sec = (
+                        0.0
+                        if is_captcha_upstream_error(summary)
+                        else upstream_retry_wait(retry_wait_sec, attempt)
+                    )
                     if own_chat:
                         _best_effort_delete_upstream_chat(state, chat_id)
                     user_msg_id = None
@@ -6305,7 +6313,7 @@ def stream_zai_completion(
                             status_code=200,
                             elapsed_ms=hist_elapsed_offset_ms + int((time.monotonic() - hist_started) * 1000),
                         )
-                    wait_sec = 0.0 if captcha_rejected else retry_wait_sec
+                    wait_sec = 0.0 if captcha_rejected else upstream_retry_wait(retry_wait_sec, attempt)
                     log_event(
                         "upstream_transient_retry",
                         attempt=attempt,
@@ -6503,6 +6511,12 @@ def is_retryable_upstream_error(message: str) -> bool:
 def is_retryable_protocol_exception(exc: BaseException) -> bool:
     """Only expose retryable status when no upstream semantic delta was seen."""
     return not bool(getattr(exc, "protocol_content_emitted", False)) and is_retryable_upstream_error(str(exc))
+
+
+def upstream_retry_wait(base_wait_sec: float, attempt: int) -> float:
+    """Back off exponentially so a busy account is not hammered by retries."""
+    exponent = max(0, int(attempt) - 1)
+    return min(120.0, max(0.0, float(base_wait_sec)) * (2**exponent))
 
 
 PENDING_DELETE_STORE_PATH = Path(__file__).with_name("pending_deletes.local.json")
@@ -8980,15 +8994,88 @@ def _restore_markdown_fenced_blocks(text: str, stashed: list[str]) -> str:
 
 
 def strip_markdown_fenced_blocks(text: str) -> str:
-    """Exclude Markdown examples from tool detection without rewriting prose."""
+    """Exclude Markdown examples from tool detection without rewriting prose.
+
+    Only fences that actually mention tool markup are removed; ordinary code
+    fences (including ones embedded in a tool argument) are left untouched.
+    """
     protected, stashed = _protect_markdown_fenced_blocks(text)
-    for index in range(len(stashed)):
-        protected = protected.replace(f"\x00GLM2API_FENCE_{index}\x00", "")
+    for index, fence in enumerate(stashed):
+        placeholder = f"\x00GLM2API_FENCE_{index}\x00"
+        protected = protected.replace(
+            placeholder,
+            "" if _TOOL_MARKUP_HINT_RE.search(fence) else fence,
+        )
     return protected
 
 
-# Full-width punctuation and smart quotes are a frequent side effect of
-# multilingual generation. Normalize only characters used by the tag shell.
+_TOOL_MARKUP_HINT_RE = re.compile(
+    r"<\s*/?\s*(?:\|{0,3}DSML\|{0,3}\s*)?(?:glm2api_)?"
+    r"(?:tool_calls|tool_call|tool_input|function_call|invoke|parameter|arg_key|arg_value)\b"
+    r"|\*\*\s*Calling:\s*\*\*",
+    re.IGNORECASE,
+)
+
+
+def _stash_inline_code_spans(text: str) -> tuple[str, list[str]]:
+    """Replace inline code spans that document tool markup with placeholders.
+
+    Models routinely document the wire format with inline ``code`` spans
+    (for example while summarising a long session).  Those spans are examples,
+    not executable calls, so they must not count as attempted tool markup.
+    Spans that merely contain ordinary code (for example a shell command in a
+    parameter value) are left untouched.
+    """
+    if "`" not in text:
+        return text, []
+    stashed: list[str] = []
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] != "`":
+            out.append(text[index])
+            index += 1
+            continue
+        run_end = index
+        while run_end < length and text[run_end] == "`":
+            run_end += 1
+        marker = text[index:run_end]
+        line_end = text.find("\n", run_end)
+        if line_end < 0:
+            line_end = length
+        close = text.find(marker, run_end, line_end)
+        if close < 0:
+            out.append(marker)
+            index = run_end
+            continue
+        span = text[index : close + len(marker)]
+        if _TOOL_MARKUP_HINT_RE.search(span):
+            out.append(f"\x00GLM2API_INLINE_{len(stashed)}\x00")
+            stashed.append(span)
+        else:
+            out.append(span)
+        index = close + len(marker)
+    return "".join(out), stashed
+
+
+def _restore_inline_code_spans(text: str, stashed: list[str]) -> str:
+    for index, span in enumerate(stashed):
+        text = text.replace(f"\x00GLM2API_INLINE_{index}\x00", span)
+    return text
+
+
+def _strip_inline_code_spans(text: str) -> str:
+    protected, stashed = _stash_inline_code_spans(text)
+    for index in range(len(stashed)):
+        protected = protected.replace(f"\x00GLM2API_INLINE_{index}\x00", "")
+    return protected
+
+
+# Full-width punctuation is a frequent side effect of multilingual
+# generation.  Tag delimiters are safe to normalize globally; smart quotes
+# must be normalized only inside a tag shell so ordinary prose and CDATA
+# argument values keep their original punctuation.
 TOOL_TAG_CHAR_TRANSLATION = str.maketrans(
     {
         "＜": "<",
@@ -9000,6 +9087,10 @@ TOOL_TAG_CHAR_TRANSLATION = str.maketrans(
         "｜": "|",
         "／": "/",
         "＝": "=",
+    }
+)
+TOOL_TAG_QUOTE_TRANSLATION = str.maketrans(
+    {
         "＂": '"',
         "“": '"',
         "”": '"',
@@ -9009,8 +9100,58 @@ TOOL_TAG_CHAR_TRANSLATION = str.maketrans(
 )
 
 
+def _translate_tool_tag_shell(markup: str) -> str:
+    """Normalize full-width tag punctuation without rewriting prose.
+
+    Smart quotes are only translated inside ``<...>`` tags (and never inside
+    CDATA), because models also use them as ordinary Chinese quotation marks
+    in answers and in file content passed as a tool argument.
+    """
+    text = str(markup or "").translate(TOOL_TAG_CHAR_TRANSLATION)
+    if not any(char in text for char in "＂“”‘’"):
+        return text
+    out: list[str] = []
+    in_tag = False
+    in_cdata = False
+    index = 0
+    length = len(text)
+    while index < length:
+        if not in_cdata and text.startswith("<![CDATA[", index):
+            in_cdata = True
+            out.append("<![CDATA[")
+            index += len("<![CDATA[")
+            continue
+        if in_cdata:
+            if text.startswith("]]>", index):
+                in_cdata = False
+                out.append("]]>")
+                index += 3
+                continue
+            out.append(text[index])
+            index += 1
+            continue
+        char = text[index]
+        if char == "<" and index + 1 < length and (
+            text[index + 1].isalnum() or text[index + 1] in "/!?|\x7f"
+        ):
+            in_tag = True
+            out.append(char)
+            index += 1
+            continue
+        if char == ">" and in_tag:
+            in_tag = False
+            out.append(char)
+            index += 1
+            continue
+        if char == "\n":
+            in_tag = False
+        out.append(char.translate(TOOL_TAG_QUOTE_TRANSLATION) if in_tag else char)
+        index += 1
+    return "".join(out)
+
+
 def canonicalize_dsml_tool_markup(markup: str) -> str:
-    markup = str(markup or "").translate(TOOL_TAG_CHAR_TRANSLATION)
+    markup = _translate_tool_tag_shell(markup)
     # Upstream occasionally writes the DSML closing slash after the pipe:
     # ``<|/DSML|parameter>`` instead of ``</|DSML|parameter>``.
     markup = re.sub(
@@ -9084,6 +9225,15 @@ def _xml_tool_value(node: ElementTree.Element) -> Any:
         grouped: dict[str, Any] = {}
         for child in children:
             key = str(child.tag).split("}")[-1]
+            if key == "parameter":
+                # The model sometimes nests adapter-level parameter tags inside
+                # an object-valued parameter (notably DeferredToolCall.input).
+                # The name attribute carries the real key; keeping the literal
+                # "parameter" key would hand the client an unusable argument
+                # object and make the tool call fail after a 200 response.
+                nested_name = str(child.attrib.get("name") or "").strip()
+                if nested_name:
+                    key = nested_name
             item = _xml_tool_value(child)
             if key in grouped:
                 grouped[key] = grouped[key] + [item] if isinstance(grouped[key], list) else [grouped[key], item]
@@ -9097,6 +9247,50 @@ def _xml_tool_value(node: ElementTree.Element) -> Any:
     return _repair_tool_path_controls(parsed) if valid else parsed
 
 
+_MISSING_TOOL_ARGUMENT = object()
+
+
+def _schema_declares_type(schema: Any, type_name: str) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    declared = schema.get("type")
+    types = (
+        {str(item).lower() for item in declared}
+        if isinstance(declared, list)
+        else {str(declared).lower()}
+    )
+    if type_name in types:
+        return True
+    if type_name == "object":
+        return isinstance(schema.get("properties"), dict)
+    if type_name == "array":
+        return isinstance(schema.get("items"), dict)
+    return False
+
+
+def _unwrap_tool_argument_envelope(arguments: dict[str, Any], tool: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap DeferredToolCall-style ``{"input": {...}}`` for resident tools."""
+    schema = tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    if not properties or "input" in properties:
+        return arguments
+    # The model often reuses DeferredToolCall's {name, input} envelope for
+    # resident tools whose schema has no "input" property.  Unwrap the object
+    # so TodoWrite and friends receive their declared fields.
+    wrapped = arguments.get("input")
+    if wrapped is None or wrapped == "" or wrapped == {}:
+        # An empty envelope carries no information; drop it so the required
+        # field repair can materialize the real container below.
+        return {key: value for key, value in arguments.items() if key != "input"}
+    if not isinstance(wrapped, dict):
+        return arguments
+    merged = dict(wrapped)
+    for key, value in arguments.items():
+        if key != "input":
+            merged.setdefault(key, value)
+    return merged
+
+
 def _normalize_emitted_tool_arguments(
     raw_arguments: Any,
     tool: dict[str, Any],
@@ -9104,7 +9298,10 @@ def _normalize_emitted_tool_arguments(
     strict: bool,
 ) -> dict[str, Any]:
     if not strict:
-        return coerce_tool_arguments_to_schema(as_json_object(raw_arguments), tool)
+        return coerce_tool_arguments_to_schema(
+            _unwrap_tool_argument_envelope(as_json_object(raw_arguments), tool),
+            tool,
+        )
     schema = tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {}
     properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
     if isinstance(raw_arguments, dict):
@@ -9122,13 +9319,30 @@ def _normalize_emitted_tool_arguments(
             arguments = {"input": _repair_tool_path_controls(parsed if valid else raw_arguments)}
         else:
             raise ToolCallFormatError("工具 arguments 不是可转换的 JSON 对象")
+    arguments = _unwrap_tool_argument_envelope(arguments, tool)
     arguments = coerce_tool_arguments_to_schema(arguments, tool)
     required = [str(name) for name in (schema.get("required") or []) if str(name)]
-    missing = [
-        name
-        for name in required
-        if name not in arguments or (isinstance(arguments.get(name), str) and not arguments[name].strip())
-    ]
+    missing: list[str] = []
+    for name in required:
+        value = arguments.get(name, _MISSING_TOOL_ARGUMENT)
+        empty = (
+            value is _MISSING_TOOL_ARGUMENT
+            or value is None
+            or (isinstance(value, str) and not value.strip())
+        )
+        if empty:
+            # An empty required object/array is almost always the model's way
+            # of saying "this tool takes no arguments" (for example an MCP tool
+            # invoked through DeferredToolCall). Materialize the empty
+            # container instead of failing the whole agent turn.
+            property_schema = properties.get(name)
+            if _schema_declares_type(property_schema, "object"):
+                arguments[name] = {}
+                continue
+            if _schema_declares_type(property_schema, "array"):
+                arguments[name] = []
+                continue
+            missing.append(name)
     if missing:
         raise ToolCallFormatError(f"工具 arguments 缺少必填字段: {', '.join(missing[:8])}")
     arguments_bytes = json_size_bytes(arguments)
@@ -9152,29 +9366,54 @@ def normalize_tool_call_candidates(
     tools_by_name = {str(tool["name"]): tool for tool in tools_allowed_by_policy(tools, policy)}
     allowed = set(tools_by_name)
     out: list[ToolCall] = []
+    rejected: list[str] = []
     for raw in raw_calls:
         if not isinstance(raw, dict):
             if strict:
-                raise ToolCallFormatError("工具调用条目不是 JSON 对象")
+                rejected.append("工具调用条目不是 JSON 对象")
             continue
         name = str(raw.get("name") or "").strip()
         if name not in allowed:
             if strict:
-                raise ToolCallFormatError(f"工具调用引用了未声明或被策略禁止的工具: {name or '<empty>'}")
+                rejected.append(f"工具调用引用了未声明或被策略禁止的工具: {name or '<empty>'}")
             continue
         if policy.mode == "forced" and name != policy.forced_name:
             if strict:
-                raise ToolCallFormatError(f"工具调用未使用强制工具: {policy.forced_name}")
+                rejected.append(f"工具调用未使用强制工具: {policy.forced_name}")
             continue
         arguments = raw.get("arguments") if "arguments" in raw else raw.get("input")
+        try:
+            normalized_arguments = _normalize_emitted_tool_arguments(
+                arguments,
+                tools_by_name[name],
+                strict=strict,
+            )
+        except ToolCallFormatError as exc:
+            if strict:
+                rejected.append(f"{name}: {exc}")
+            continue
         out.append(
             ToolCall(
                 # Surface-native prefixes (call_/fc_/toolu_) and a standard
                 # 24-char id body keep strict SDK validation happy.
                 id=id_prefix + uuid.uuid4().hex[:24],
                 name=name,
-                arguments=_normalize_emitted_tool_arguments(arguments, tools_by_name[name], strict=strict),
+                arguments=normalized_arguments,
             )
+        )
+    if strict and rejected:
+        if not out:
+            raise ToolCallFormatError(rejected[0])
+        # Long agent turns usually batch several tools. One malformed sibling
+        # must not discard the calls the model did serialize correctly, and a
+        # 500 here would lose the entire turn. Keep the valid subset and make
+        # the drop visible in the log instead.
+        log_event(
+            "tool_calls_partially_salvaged",
+            level=logging.WARNING,
+            recovered=len(out),
+            dropped=len(rejected),
+            errors=rejected[:5],
         )
     if strict and policy.disable_parallel and len(out) > 1:
         raise ToolCallFormatError("客户端已禁用并行工具调用，但上游返回了多个调用")
@@ -9231,10 +9470,20 @@ def parse_xml_tool_calls(
             if not param_name:
                 continue
             arguments[param_name] = _xml_tool_value(parameter)
-        if not arguments:
-            arguments_node = invoke.find("./arguments")
-            if arguments_node is not None:
-                arguments = "".join(arguments_node.itertext()).strip()
+        # Some model runs write the object body as a direct <input>/<arguments>
+        # child instead of a named parameter. Accept it alongside parameters so
+        # a valid call is not reported as a missing required field.
+        direct_arguments: Any = None
+        for tag in ("input", "arguments"):
+            node = invoke.find("./" + tag)
+            if node is not None:
+                direct_arguments = _xml_tool_value(node)
+                break
+        if direct_arguments is not None:
+            if not arguments:
+                arguments = direct_arguments
+            elif isinstance(arguments, dict) and isinstance(direct_arguments, dict):
+                arguments.update(direct_arguments)
         raw_calls.append({"name": name, "arguments": arguments})
     return normalize_tool_call_candidates(raw_calls, tools, policy, id_prefix=id_prefix, strict=True)
 
@@ -9675,7 +9924,7 @@ def parse_tool_calls_from_output(
 ) -> list[ToolCall]:
     if not text.strip() or not tools or policy.mode == "none":
         return []
-    visible_for_parse = strip_markdown_fenced_blocks(text).strip()
+    visible_for_parse = _strip_inline_code_spans(strip_markdown_fenced_blocks(text)).strip()
     if not visible_for_parse:
         return []
     matches = list(TOOL_JSON_WRAPPER_RE.finditer(visible_for_parse))
@@ -9727,7 +9976,9 @@ def parse_tool_calls_from_output(
 
 
 def tool_markup_attempted(text: str) -> bool:
-    visible = canonicalize_dsml_tool_markup(strip_markdown_fenced_blocks(str(text or "")))
+    visible = canonicalize_dsml_tool_markup(
+        _strip_inline_code_spans(strip_markdown_fenced_blocks(str(text or "")))
+    )
     return bool(
         re.search(r"<\s*/?\s*(?:glm2api_)?tool_calls\b", visible, re.IGNORECASE)
         or re.search(r"<\s*/?\s*(?:invoke|parameter)\b", visible, re.IGNORECASE)
@@ -9807,6 +10058,7 @@ def strip_parsed_tool_markup(text: str) -> str:
     examples in the answer.
     """
     protected, stashed = _protect_markdown_fenced_blocks(str(text))
+    protected, inline_stashed = _stash_inline_code_spans(protected)
     protected = canonicalize_dsml_tool_markup(protected)
     protected = TOOL_JSON_WRAPPER_RE.sub("", protected)
     protected = TOOL_XML_BLOCK_RE.sub("", protected)
@@ -9862,6 +10114,7 @@ def strip_parsed_tool_markup(text: str) -> str:
         protected,
         flags=re.IGNORECASE,
     )
+    protected = _restore_inline_code_spans(protected, inline_stashed)
     return _restore_markdown_fenced_blocks(protected, stashed).strip()
 
 
@@ -13670,7 +13923,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         thinking_parts: list[str] = []
         stream_budget = UpstreamStreamBudget()
         last_client_write = time.monotonic()
-        client_output_emitted = False
         text_streamed = False
         thinking_streamed = False
         tool_call_index = 0
@@ -13683,7 +13935,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 last_client_write = now
 
         def write_content_chunk(text: str) -> None:
-            nonlocal client_output_emitted, text_streamed, last_client_write
+            nonlocal text_streamed, last_client_write
             if not text:
                 return
             self._write_openai_chunk(
@@ -13695,12 +13947,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                 }
             )
-            client_output_emitted = True
             text_streamed = True
             last_client_write = time.monotonic()
 
         def write_reasoning_chunk(text: str) -> None:
-            nonlocal client_output_emitted, thinking_streamed, last_client_write
+            nonlocal thinking_streamed, last_client_write
             if not text:
                 return
             self._write_openai_chunk(
@@ -13712,12 +13963,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": None}],
                 }
             )
-            client_output_emitted = True
             thinking_streamed = True
             last_client_write = time.monotonic()
 
         def write_tool_call(call: ToolCall) -> None:
-            nonlocal client_output_emitted, tool_call_index, last_client_write
+            nonlocal tool_call_index, last_client_write
             self._write_openai_chunk(
                 {
                     "id": completion_id,
@@ -13746,7 +13996,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 }
             )
             tool_call_index += 1
-            client_output_emitted = True
             last_client_write = time.monotonic()
 
         def write_stream_actions(actions: list[tuple[str, Any]]) -> None:
@@ -13838,7 +14087,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "".join(thinking_parts),
                 _regenerate_required_turn,
                 release_initial_output,
-                allow_retry=not client_output_emitted,
+                # A replacement turn is safe while no tool call has been sent:
+                # its prose is suppressed because text_streamed already reflects
+                # the first attempt, and only its tool calls are forwarded.
+                # Losing a long agent turn to a 500 is the worse outcome.
+                allow_retry=tool_call_index == 0,
             )
             text_parts.clear()
             thinking_parts.clear()

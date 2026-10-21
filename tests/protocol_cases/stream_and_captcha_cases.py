@@ -21,6 +21,13 @@ class StreamAndCaptchaCases:
         before_delta.protocol_content_emitted = True
         self.assertFalse(app.is_retryable_protocol_exception(before_delta))
 
+    def test_upstream_retry_wait_backs_off_exponentially(self) -> None:
+        self.assertEqual(3.0, app.upstream_retry_wait(3.0, 1))
+        self.assertEqual(6.0, app.upstream_retry_wait(3.0, 2))
+        self.assertEqual(12.0, app.upstream_retry_wait(3.0, 3))
+        self.assertEqual(0.0, app.upstream_retry_wait(0.0, 2))
+        self.assertEqual(120.0, app.upstream_retry_wait(120.0, 6))
+
     def test_stream_retries_upstream_interrupted_during_new_chat(self) -> None:
         state = fake_state()
         new_chat_calls = 0
@@ -702,25 +709,150 @@ class StreamAndCaptchaCases:
         self.assertIn("-THINK_TWO", raw)
         self.assertNotIn("<|DSML|", raw)
 
-    def test_stream_tool_retry_is_skipped_after_realtime_thinking(self) -> None:
+    def test_stream_recovers_nested_and_empty_object_tool_arguments(self) -> None:
+        current_stream = app.stream_zai_completion
+        original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
+        original_new_chat = app.new_chat
+        original_urlopen = app.urlopen
+
+        class FakeResp:
+            def __init__(self, chunks):
+                self.chunks = chunks
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(self.chunks)
+
+        content = (
+            "现在并行执行：查看目录内容、确认 GitHub 身份、建立任务清单。\n"
+            "<|DSML|tool_calls>\n"
+            '  <|DSML|invoke name="DeferredToolCall">\n'
+            '    <|DSML|parameter name="name"><![CDATA[mcp__github__get_me]]></|DSML|parameter>\n'
+            '    <|DSML|parameter name="input"></|DSML|parameter>\n'
+            "  </|DSML|invoke>\n"
+            '  <|DSML|invoke name="DeferredToolCall">\n'
+            '    <|DSML|parameter name="name"><![CDATA[mcp__github__search_repositories]]></|DSML|parameter>\n'
+            '    <|DSML|parameter name="input">\n'
+            "      <query><![CDATA[NFQtoFa in:name]]></query>\n"
+            "      <perPage>10</perPage>\n"
+            "    </|DSML|parameter>\n"
+            "  </|DSML|invoke>\n"
+            '  <|DSML|invoke name="DeferredToolCall">\n'
+            '    <|DSML|parameter name="name"><![CDATA[TodoWrite]]></|DSML|parameter>\n'
+            '    <|DSML|parameter name="input">\n'
+            "      <todos><item><content><![CDATA[check]]></content>"
+            "<status><![CDATA[in_progress]]></status>"
+            "<priority><![CDATA[high]]></priority></item></todos>\n"
+            "    </|DSML|parameter>\n"
+            "  </|DSML|invoke>\n"
+            "</|DSML|tool_calls>"
+        )
+        chunks = [
+            (
+                "data: "
+                + json.dumps({"data": {"delta_content": content, "phase": "answer"}}, ensure_ascii=False)
+                + "\n\n"
+            ).encode("utf-8"),
+            b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+        ]
+
+        def fake_new_chat(_state, _prompt, options=None):
+            return "00000000-0000-0000-0000-0000000000f1", "u1"
+
+        def fake_urlopen(_request, timeout=None):
+            return FakeResp(chunks)
+
+        app.stream_zai_completion = self.original_stream
+        app.new_chat = fake_new_chat
+        app.urlopen = fake_urlopen
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.3",
+                    "messages": [{"role": "user", "content": "检查环境"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "DeferredToolCall",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "input": {"type": "object", "additionalProperties": {}},
+                                    },
+                                    "required": ["name", "input"],
+                                },
+                            },
+                        }
+                    ],
+                    "tool_choice": "auto",
+                    "stream": True,
+                },
+            )
+        finally:
+            app.stream_zai_completion = current_stream
+            app.new_chat = original_new_chat
+            app.urlopen = original_urlopen
+            app.SSE_KEEPALIVE_INTERVAL_SECONDS = original_interval
+
+        self.assertEqual(200, status, raw[:500])
+        self.assertNotIn('"error"', raw)
+        calls = []
+        for line in raw.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except ValueError:
+                continue
+            for choice in payload.get("choices") or []:
+                for call in (choice.get("delta") or {}).get("tool_calls") or []:
+                    calls.append(call)
+        self.assertEqual(3, len(calls), raw[:1000])
+        arguments = [json.loads(call["function"]["arguments"]) for call in calls]
+        self.assertEqual({"name": "mcp__github__get_me", "input": {}}, arguments[0])
+        self.assertEqual(
+            {"name": "mcp__github__search_repositories", "input": {"query": "NFQtoFa in:name", "perPage": 10}},
+            arguments[1],
+        )
+        self.assertEqual(
+            {
+                "name": "TodoWrite",
+                "input": {"todos": [{"content": "check", "status": "in_progress", "priority": "high"}]},
+            },
+            arguments[2],
+        )
+        self.assertIn("现在并行执行", raw)
+        self.assertNotIn("<|DSML|", raw)
+
+    def test_stream_tool_retry_recovers_after_realtime_thinking(self) -> None:
         status, raw, attempts, deleted = self._run_stream_tool_retry_case(
             first_attempt_thinking=True
         )
         self.assertEqual(200, status, raw[:500])
-        self.assertEqual(1, attempts["count"], "thinking 已实时转发后不应重放首轮")
-        self.assertIn(": keep-alive", raw)
+        self.assertEqual(2, attempts["count"], "thinking 已转发时仍应重试，但不得重放首轮")
         self.assertIn("FAILED_THINKING", raw)
-        self.assertNotIn("GOOD_THINKING", raw)
-        self.assertNotIn('"tool_calls"', raw)
+        self.assertNotIn("GOOD_THINKING", raw, "重试轮的 thinking 不应重复发送")
+        self.assertIn('"tool_calls"', raw)
+        self.assertIn("接下来我会查询天气", raw)
         self.assertNotIn("<|DSML|tool_calls>", raw)
-        self.assertIn('"error"', raw)
-        self.assertEqual(1, len(deleted), "失败首轮会话应清理")
+        self.assertEqual(2, len(deleted), "失败首轮与成功重试会话都应清理")
         records = app.local_history_records()
         self.assertEqual(1, len(records), "一次客户端请求不应产生两条历史记录")
         detail = app.get_local_history_record(str(records[0]["id"])) or {}
-        self.assertEqual("error", detail["status"])
-        self.assertEqual(0, detail.get("tool_retry_count", 0))
-        self.assertNotIn("Tool-call correction:", str(detail.get("final_prompt") or ""))
+        self.assertEqual("success", detail["status"])
+        self.assertEqual("tool_calls", detail["finish_reason"])
+        self.assertEqual(1, detail["tool_retry_count"])
+        self.assertIn("Tool-call correction:", str(detail.get("final_prompt") or ""))
 
     def test_stream_tool_retry_recovers_when_no_output_was_sent(self) -> None:
         status, raw, attempts, deleted = self._run_stream_tool_retry_case(
