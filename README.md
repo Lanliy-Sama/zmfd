@@ -206,8 +206,9 @@ profiles.local.json
 
 - 仅当回答尚未输出任何内容（流首错误）且本次调用自建会话时重试：删除被中断的空会话 → 等待 → 新建会话重发；对客户端完全透明，错误不透传。
 - 默认等待 **3 秒**、最多尝试 **3 次**；可在面板「设置」页调整"繁忙重试等待（秒）"（0–120）与"繁忙重试次数上限"（1–6），保存到 `settings.local.json`。
+- **静默看门狗与 thinking-only 断流重试**：流已开始输出后，如果连续 60 秒（面板"上游静默看门狗（秒）"，0–300，0 关闭）没有新的 thinking/正文 delta，代理会主动断开上游流并按重试策略换会话重发，避免空等 300 秒 socket 超时；上游在仅输出 thinking 后提前 EOF 也会走同样的换会话重试。若首轮只输出过 thinking，重试轮会丢弃新的 thinking，避免客户端看到重复内容；若已经输出正文或工具调用，则快速报错而不重放。
 - 复用会话（continue/reuse）模式不内部重试（换会话会破坏"保持当前会话 ID"语义），错误原样透传。
-- 可重试错误：`MODEL_CONCURRENCY_LIMIT`、繁忙/限流类关键词、实测创建 chat 阶段的“上游中断”、HTTP 429/500/502/503/504/520–525，以及**验证码被上游拒绝**（`FRONTEND_CAPTCHA_REQUIRED` F018/F019，见下文验证码时效）。所有重试都限定在尚未向客户端输出回答时；鉴权、内容审核类错误及已开始的回答一律原样结束，不做内部重放。
+- 可重试错误：`MODEL_CONCURRENCY_LIMIT`、繁忙/限流类关键词、实测创建 chat 阶段的“上游中断”、HTTP 429/500/502/503/504/520–525，以及**验证码被上游拒绝**（`FRONTEND_CAPTCHA_REQUIRED` F018/F019，见下文验证码时效）。普通瞬时错误的重试限定在尚未向客户端输出回答时；静默看门狗可在仅输出 thinking 后重试并抑制重复 thinking。鉴权、内容审核类错误及已开始的正文一律原样结束，不做内部重放。
 - **验证码失效重试不等待**：繁忙类错误等待 `wait_sec` 再试；验证码类错误无需等待（验证码是一次性凭据，不存在"繁忙"），立即换会话并**强制现场重解**（绕开验证码池与降级缓存，日志 `fresh_captcha_ready` 带 `force_fresh: true`）。
 - 内部重试耗尽后的错误按协议规范返回，让客户端 SDK 走标准退避而非把 500 当未知故障：OpenAI 面 `503 server_error`、Anthropic 面 `529 overloaded_error`，均带 `Retry-After: 3`；Anthropic 流式错误事件同样标记 `overloaded_error`。
 - 相关日志事件：`upstream_transient_retry`（attempt/wait_sec/error/reason）、`retry_cleanup_delete_error`（清理失败）。
@@ -351,7 +352,7 @@ python .\glm2api.py --har ..\zchat.z.ai.har --prompt "只输出 OK" --model glm-
 
 启动器使用独立 `scripts/check_happydom.mjs` 探测 Node 依赖，并通过 `scripts/startup_helpers.ps1` 读取原生命令退出码。Windows PowerShell 5 不会再把依赖尚未安装时的 Node stderr 当作终止性 `NativeCommandError`；探测失败会继续进入 npm 自动安装或 Playwright 回退。
 
-上游流式响应有“无数据间隔”超时（默认 300 秒）：深度思考时上游可能长时间不吐数据，超时会被视为中断。可在面板“模型与推理控制 → 上游响应超时（秒）”调整并保存，立即生效；也可用 `--upstream-timeout-sec <60-3600>` 在启动时锁定，此时面板不可覆盖。`--quiet` 可关闭逐请求访问日志。
+上游流式响应有“无数据间隔”超时（默认 300 秒）：深度思考时上游可能长时间不吐数据，超时会被视为中断。可在面板“模型与推理控制 → 上游响应超时（秒）”调整并保存，立即生效；也可用 `--upstream-timeout-sec <60-3600>` 在启动时锁定，此时面板不可覆盖。另有静默看门狗（默认 60 秒，0 关闭，`--upstream-stall-timeout-sec`）：流已经开始输出后，连续 N 秒没有新的 thinking/正文 delta 就主动断流并换会话重试。`--quiet` 可关闭逐请求访问日志。
 
 `POST /api/chat` 和 `POST /v1/chat/completions` 可传这些扩展字段：
 

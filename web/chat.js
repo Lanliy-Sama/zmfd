@@ -1066,6 +1066,7 @@
               include_thinking: includeThinkingToggle.checked,
               delete_chat_after_completion: autoDeleteToggle.checked,
               upstream_timeout_sec: Number(upstreamTimeoutInput.value) || 300,
+              upstream_stall_timeout_sec: Number(upstreamStallTimeoutInput.value) || 0,
               upstream_retry_wait_sec: Number(upstreamRetryWaitInput.value) || 0,
               upstream_retry_max_attempts: Number(upstreamRetryAttemptsInput.value) || 3,
               history_max_records: Number(historyMaxRecordsInput.value) || 300

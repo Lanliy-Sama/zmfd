@@ -600,6 +600,10 @@ DEFAULT_ENABLE_THINKING = True
 DEFAULT_REASONING_EFFORT = "max"
 DEFAULT_DELETE_CHAT_AFTER_COMPLETION = True
 UPSTREAM_STREAM_TIMEOUT_SEC = 300  # 上游流式响应“无数据间隔”超时（秒）
+# 流已经产出过 delta 后，连续 N 秒没有任何新的 thinking/正文 delta 视为
+# 模型静默卡死：主动断流并换会话重试，避免空等 socket 超时。0 关闭。
+DEFAULT_UPSTREAM_STALL_TIMEOUT_SEC = 60.0
+MAX_UPSTREAM_STALL_TIMEOUT_SEC = 300.0
 # 上游繁忙（HAR 实测 MODEL_CONCURRENCY_LIMIT）默认等待后重试；可在面板设置调整。
 DEFAULT_UPSTREAM_RETRY_WAIT_SEC = 3.0
 DEFAULT_UPSTREAM_RETRY_ATTEMPTS = 3
@@ -802,6 +806,7 @@ _UPSTREAM_STREAM_WIRE_REJECTED_TOTAL = 0
 _UPSTREAM_STREAM_OUTPUT_REJECTED_TOTAL = 0
 _UPSTREAM_STREAM_EVENT_REJECTED_TOTAL = 0
 _UPSTREAM_STREAM_INCOMPLETE_TOTAL = 0
+_UPSTREAM_STALL_TIMEOUT_TOTAL = 0
 
 
 class UpstreamStreamBudget:
@@ -883,6 +888,7 @@ def upstream_response_status() -> dict[str, int]:
             "stream_output_rejected_total": max(0, int(_UPSTREAM_STREAM_OUTPUT_REJECTED_TOTAL)),
             "stream_event_rejected_total": max(0, int(_UPSTREAM_STREAM_EVENT_REJECTED_TOTAL)),
             "stream_incomplete_total": max(0, int(_UPSTREAM_STREAM_INCOMPLETE_TOTAL)),
+            "stall_timeout_total": max(0, int(_UPSTREAM_STALL_TIMEOUT_TOTAL)),
             "stream_wire_max_bytes": MAX_UPSTREAM_STREAM_WIRE_BYTES,
             "stream_output_max_bytes": MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
             "stream_max_events": MAX_UPSTREAM_STREAM_EVENTS,
@@ -2979,6 +2985,7 @@ def local_settings_defaults() -> dict[str, Any]:
         "include_thinking": False,
         "delete_chat_after_completion": DEFAULT_DELETE_CHAT_AFTER_COMPLETION,
         "upstream_timeout_sec": UPSTREAM_STREAM_TIMEOUT_SEC,
+        "upstream_stall_timeout_sec": DEFAULT_UPSTREAM_STALL_TIMEOUT_SEC,
         "upstream_retry_wait_sec": DEFAULT_UPSTREAM_RETRY_WAIT_SEC,
         "upstream_retry_max_attempts": DEFAULT_UPSTREAM_RETRY_ATTEMPTS,
         "history_max_records": 300,
@@ -2997,6 +3004,21 @@ def normalize_local_settings(body: dict[str, Any], defaults: dict[str, Any] | No
         upstream_timeout_sec = max(60, min(3600, upstream_timeout_sec))
     except (TypeError, ValueError):
         upstream_timeout_sec = int(base.get("upstream_timeout_sec", UPSTREAM_STREAM_TIMEOUT_SEC))
+    try:
+        upstream_stall_timeout_sec = float(
+            body.get(
+                "upstream_stall_timeout_sec",
+                base.get("upstream_stall_timeout_sec", DEFAULT_UPSTREAM_STALL_TIMEOUT_SEC),
+            )
+        )
+        upstream_stall_timeout_sec = max(
+            0.0,
+            min(MAX_UPSTREAM_STALL_TIMEOUT_SEC, upstream_stall_timeout_sec),
+        )
+    except (TypeError, ValueError):
+        upstream_stall_timeout_sec = float(
+            base.get("upstream_stall_timeout_sec", DEFAULT_UPSTREAM_STALL_TIMEOUT_SEC)
+        )
     try:
         upstream_retry_wait_sec = float(
             body.get("upstream_retry_wait_sec", base.get("upstream_retry_wait_sec", DEFAULT_UPSTREAM_RETRY_WAIT_SEC))
@@ -3027,6 +3049,7 @@ def normalize_local_settings(body: dict[str, Any], defaults: dict[str, Any] | No
         "include_thinking": options.include_thinking,
         "delete_chat_after_completion": options.delete_chat_after_completion,
         "upstream_timeout_sec": upstream_timeout_sec,
+        "upstream_stall_timeout_sec": upstream_stall_timeout_sec,
         "upstream_retry_wait_sec": upstream_retry_wait_sec,
         "upstream_retry_max_attempts": upstream_retry_max_attempts,
         "history_max_records": history_max_records,
@@ -5915,6 +5938,7 @@ def stream_zai_completion(
     captcha_headless: bool = True,
     captcha_timeout_ms: int = 75_000,
     upstream_timeout_sec: int | None = None,
+    upstream_stall_timeout_sec: float | None = None,
     options: ChatOptions | None = None,
     context_out: dict[str, Any] | None = None,
     files: list[dict[str, Any]] | None = None,
@@ -5929,10 +5953,15 @@ def stream_zai_completion(
     preserve_chat_on_generator_close: bool = False,
 ) -> Any:
     global _UPSTREAM_STREAM_INCOMPLETE_TOTAL
+    global _UPSTREAM_STALL_TIMEOUT_TOTAL
     options = options or ChatOptions()
     assistant_msg_id = require_uuid(assistant_msg_id, "assistant_message_id") if assistant_msg_id else str(uuid.uuid4())
     retry_attempts = max(1, int(retry_attempts))
     retry_wait_sec = max(0.0, float(retry_wait_sec))
+    stall_timeout_sec = max(
+        0.0,
+        min(MAX_UPSTREAM_STALL_TIMEOUT_SEC, float(upstream_stall_timeout_sec or 0.0)),
+    )
     parent_message_id = require_uuid(parent_message_id, "parent_message_id") if parent_message_id else None
     # 普通复用会话仍不重试；GLM-5.3 多批上下文的后续波次显式允许在同一
     # parent 上换 message id 重传，严格对齐官网抓包，不会偷偷换 chat。
@@ -6004,9 +6033,15 @@ def stream_zai_completion(
         )
 
     try:
+        # A stall retry after thinking-only output must not replay thinking that
+        # the client already received.  The retry still runs normally but its
+        # thinking deltas are dropped from the downstream stream.
+        suppress_thinking_on_retry = False
         while True:
             attempt += 1
             last_attempt = attempt >= retry_attempts
+            last_delta_at: float | None = None
+            answer_emitted = False
             if cancel_check is not None:
                 cancel_check()
             attempt_files = files
@@ -6154,9 +6189,52 @@ def stream_zai_completion(
                 stream_started = time.time()
                 retry_transient = ""
                 retry_incomplete = False
+                retry_stall = False
                 terminal_received = False
                 if isinstance(context_out, dict):
                     context_out.pop("_stream_incomplete", None)
+
+                def stall_expired() -> bool:
+                    return (
+                        stall_timeout_sec > 0
+                        and last_delta_at is not None
+                        and (time.monotonic() - last_delta_at) > stall_timeout_sec
+                    )
+
+                def handle_stall() -> None:
+                    nonlocal retry_transient, retry_incomplete, retry_stall, suppress_thinking_on_retry
+                    global _UPSTREAM_STALL_TIMEOUT_TOTAL
+                    message = (
+                        f"上游静默超过 {stall_timeout_sec:g} 秒，未收到新的 thinking/正文"
+                    )
+                    with _UPSTREAM_RESPONSE_STATS_LOCK:
+                        _UPSTREAM_STALL_TIMEOUT_TOTAL += 1
+                    retrying = bool(not answer_emitted and not last_attempt and can_retry)
+                    log_event(
+                        "upstream_stall_timeout",
+                        level=logging.WARNING,
+                        chat_id_fp=sha16(str(chat_id or "")),
+                        model=options.model,
+                        attempt=attempt,
+                        max_attempts=retry_attempts,
+                        elapsed_ms=int((time.time() - stream_started) * 1000),
+                        events=event_count,
+                        content_emitted=content_emitted,
+                        answer_emitted=answer_emitted,
+                        retrying=retrying,
+                    )
+                    if retrying:
+                        retry_transient = message
+                        retry_incomplete = True
+                        retry_stall = True
+                        suppress_thinking_on_retry = True
+                        return
+                    if isinstance(context_out, dict):
+                        context_out["_stream_incomplete"] = True
+                    exc = UpstreamStreamIncomplete(message)
+                    exc.protocol_content_emitted = content_emitted
+                    raise exc
+
                 try:
                     chunks = iter_upstream_chunks_with_heartbeat(
                         resp,
@@ -6165,6 +6243,12 @@ def stream_zai_completion(
                     for chunk in chunks:
                         if cancel_check is not None:
                             cancel_check()
+                        if stall_expired():
+                            handle_stall()
+                            close_chunks = getattr(chunks, "close", None)
+                            if callable(close_chunks):
+                                close_chunks()
+                            break
                         if chunk is None:
                             yield UPSTREAM_IDLE_HEARTBEAT_EVENT
                             continue
@@ -6195,17 +6279,25 @@ def stream_zai_completion(
                                 retry_transient = error
                                 break
                             delta, _phase = extract_delta_from_event(event)
+                            suppress_event = False
                             if delta:
                                 stream_budget.observe_delta(delta)
                                 content_emitted = True
+                                last_delta_at = time.monotonic()
                                 if _phase.lower() == "thinking":
-                                    thinking_chars = append_text_prefix(
-                                        thinking_parts,
-                                        delta,
-                                        thinking_chars,
-                                        HISTORY_THINKING_CHARS,
-                                    )
+                                    if suppress_thinking_on_retry:
+                                        # The first attempt's thinking already
+                                        # reached the client; do not replay it.
+                                        suppress_event = True
+                                    else:
+                                        thinking_chars = append_text_prefix(
+                                            thinking_parts,
+                                            delta,
+                                            thinking_chars,
+                                            HISTORY_THINKING_CHARS,
+                                        )
                                 else:
+                                    answer_emitted = True
                                     answer_chars = append_text_prefix(
                                         answer_parts,
                                         delta,
@@ -6214,7 +6306,11 @@ def stream_zai_completion(
                                     )
                                 _hist_progress_tick()
                             event_count += 1
-                            yield event
+                            if stall_expired():
+                                handle_stall()
+                                break
+                            if not suppress_event:
+                                yield event
                         if retry_transient:
                             close_chunks = getattr(chunks, "close", None)
                             if callable(close_chunks):
@@ -6236,17 +6332,23 @@ def stream_zai_completion(
                             retry_transient = error
                         else:
                             delta, _phase = extract_delta_from_event(event)
+                            suppress_event = False
                             if delta:
                                 stream_budget.observe_delta(delta)
                                 content_emitted = True
+                                last_delta_at = time.monotonic()
                                 if _phase.lower() == "thinking":
-                                    thinking_chars = append_text_prefix(
-                                        thinking_parts,
-                                        delta,
-                                        thinking_chars,
-                                        HISTORY_THINKING_CHARS,
-                                    )
+                                    if suppress_thinking_on_retry:
+                                        suppress_event = True
+                                    else:
+                                        thinking_chars = append_text_prefix(
+                                            thinking_parts,
+                                            delta,
+                                            thinking_chars,
+                                            HISTORY_THINKING_CHARS,
+                                        )
                                 else:
+                                    answer_emitted = True
                                     answer_chars = append_text_prefix(
                                         answer_parts,
                                         delta,
@@ -6255,11 +6357,15 @@ def stream_zai_completion(
                                     )
                                 _hist_progress_tick()
                             event_count += 1
-                            yield event
+                            if stall_expired():
+                                handle_stall()
+                            elif not suppress_event:
+                                yield event
                     if not retry_transient and not terminal_received:
                         message = "上游中断：SSE 在完成标记前结束"
                         with _UPSTREAM_RESPONSE_STATS_LOCK:
                             _UPSTREAM_STREAM_INCOMPLETE_TOTAL += 1
+                        retrying = bool(not answer_emitted and not last_attempt and can_retry)
                         log_event(
                             "upstream_stream_incomplete",
                             level=logging.WARNING,
@@ -6269,10 +6375,17 @@ def stream_zai_completion(
                             max_attempts=retry_attempts,
                             events=event_count,
                             content_emitted=content_emitted,
+                            answer_emitted=answer_emitted,
+                            retrying=retrying,
                         )
-                        if not content_emitted and not last_attempt and can_retry:
+                        if retrying:
                             retry_transient = message
                             retry_incomplete = True
+                            if content_emitted and not answer_emitted:
+                                # Thinking-only: the first attempt's thinking
+                                # already reached the client. Keep it and drop
+                                # the replacement turn's thinking.
+                                suppress_thinking_on_retry = True
                         else:
                             if isinstance(context_out, dict):
                                 context_out["_stream_incomplete"] = True
@@ -6293,16 +6406,23 @@ def stream_zai_completion(
                         _best_effort_delete_upstream_chat(
                             state,
                             chat_id,
-                            reason="stream_incomplete" if retry_incomplete else "retry",
+                            reason=(
+                                "stall_timeout"
+                                if retry_stall
+                                else "stream_incomplete"
+                                if retry_incomplete
+                                else "retry"
+                            ),
                         )
                     captcha_rejected = is_captcha_upstream_error(retry_transient)
                     if captcha_rejected:
                         # 验证码被拒（超龄/一次性已耗）：无需等待，强制下一轮现场重解。
                         force_fresh_captcha = True
                     answer_parts.clear()
-                    thinking_parts.clear()
+                    if not suppress_thinking_on_retry:
+                        thinking_parts.clear()
+                        thinking_chars = 0
                     answer_chars = 0
-                    thinking_chars = 0
                     stream_budget.reset()
                     user_msg_id = None
                     assistant_msg_id = str(uuid.uuid4())
@@ -6322,6 +6442,8 @@ def stream_zai_completion(
                         reason=(
                             "captcha_rejected"
                             if captcha_rejected
+                            else "stall_timeout"
+                            if retry_stall
                             else "stream_incomplete"
                             if retry_incomplete
                             else "transient_busy"
@@ -7298,6 +7420,7 @@ def direct_prompt(
     captcha_headless: bool = True,
     captcha_timeout_ms: int = 75_000,
     upstream_timeout_sec: int | None = None,
+    upstream_stall_timeout_sec: float | None = None,
     include_thinking: bool = False,
     options: ChatOptions | None = None,
 ) -> str:
@@ -7332,6 +7455,7 @@ def direct_prompt(
             captcha_headless=captcha_headless,
             captcha_timeout_ms=captcha_timeout_ms,
             upstream_timeout_sec=upstream_timeout_sec,
+            upstream_stall_timeout_sec=upstream_stall_timeout_sec,
             options=options,
             context_out=context,
             history_ctx={
@@ -10985,6 +11109,7 @@ def preload_zai_context_waves(
     captcha_headless: bool = True,
     captcha_timeout_ms: int = 75_000,
     upstream_timeout_sec: int | None = None,
+    upstream_stall_timeout_sec: float | None = None,
     retry_wait_sec: float = DEFAULT_UPSTREAM_RETRY_WAIT_SEC,
     retry_attempts: int = DEFAULT_UPSTREAM_RETRY_ATTEMPTS,
     cancel_check: Callable[[], None] | None = None,
@@ -11062,6 +11187,7 @@ def preload_zai_context_waves(
                 captcha_headless=captcha_headless,
                 captcha_timeout_ms=captcha_timeout_ms,
                 upstream_timeout_sec=upstream_timeout_sec,
+                upstream_stall_timeout_sec=upstream_stall_timeout_sec,
                 options=preload_options,
                 context_out=context,
                 files=initial_files,
@@ -11562,6 +11688,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     captcha_headless: bool = True
     captcha_timeout_ms: int = 75_000
     upstream_timeout_sec: int = UPSTREAM_STREAM_TIMEOUT_SEC
+    upstream_stall_timeout_sec: float = DEFAULT_UPSTREAM_STALL_TIMEOUT_SEC
     upstream_retry_wait_sec: float = DEFAULT_UPSTREAM_RETRY_WAIT_SEC
     upstream_retry_max_attempts: int = DEFAULT_UPSTREAM_RETRY_ATTEMPTS
     upstream_timeout_locked: bool = False  # CLI --upstream-timeout-sec 显式配置时面板不可覆盖
@@ -12392,6 +12519,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     captcha_headless=self.captcha_headless,
                     captcha_timeout_ms=self.captcha_timeout_ms,
                     upstream_timeout_sec=self.upstream_timeout_sec,
+                    upstream_stall_timeout_sec=self.upstream_stall_timeout_sec,
                     retry_wait_sec=self.upstream_retry_wait_sec,
                     retry_attempts=self.upstream_retry_max_attempts,
                     cancel_check=self._check_request_cancelled,
@@ -12522,6 +12650,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             captcha_headless=self.captcha_headless,
             captcha_timeout_ms=self.captcha_timeout_ms,
             upstream_timeout_sec=self.upstream_timeout_sec,
+            upstream_stall_timeout_sec=self.upstream_stall_timeout_sec,
             retry_wait_sec=self.upstream_retry_wait_sec,
             retry_attempts=self.upstream_retry_max_attempts,
             options=request.options,
@@ -13036,6 +13165,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.__class__.upstream_timeout_sec = int(
                     normalized.get("upstream_timeout_sec") or UPSTREAM_STREAM_TIMEOUT_SEC
                 )
+            self.__class__.upstream_stall_timeout_sec = float(
+                normalized.get("upstream_stall_timeout_sec", DEFAULT_UPSTREAM_STALL_TIMEOUT_SEC)
+            )
             self.__class__.upstream_retry_wait_sec = float(
                 normalized.get("upstream_retry_wait_sec", DEFAULT_UPSTREAM_RETRY_WAIT_SEC)
             )
@@ -13575,6 +13707,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             with self.settings_state_lock:
                 settings_snapshot = dict(self.settings)
                 upstream_timeout_sec = self.upstream_timeout_sec
+                upstream_stall_timeout_sec = self.upstream_stall_timeout_sec
                 upstream_retry_wait_sec = self.upstream_retry_wait_sec
                 upstream_retry_max_attempts = self.upstream_retry_max_attempts
             if api_key_config["enabled"] and not self._api_key_authorized():
@@ -13589,6 +13722,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "api_key_source": api_key_config["source"],
                         "api_key_saved_at": api_key_config["saved_at"],
                         "upstream_timeout_sec": upstream_timeout_sec,
+                        "upstream_stall_timeout_sec": upstream_stall_timeout_sec,
                         "upstream_retry_wait_sec": upstream_retry_wait_sec,
                         "upstream_retry_max_attempts": upstream_retry_max_attempts,
                     },
@@ -13628,6 +13762,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     ),
                     "playwright_available": playwright_package_available(),
                     "upstream_timeout_sec": upstream_timeout_sec,
+                    "upstream_stall_timeout_sec": upstream_stall_timeout_sec,
                     "upstream_retry_wait_sec": upstream_retry_wait_sec,
                     "upstream_retry_max_attempts": upstream_retry_max_attempts,
                     "include_thinking": self.include_thinking,
@@ -14907,6 +15042,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         captcha_headless=self.captcha_headless,
                         captcha_timeout_ms=self.captcha_timeout_ms,
                         upstream_timeout_sec=self.upstream_timeout_sec,
+                        upstream_stall_timeout_sec=self.upstream_stall_timeout_sec,
                         retry_wait_sec=self.upstream_retry_wait_sec,
                         retry_attempts=self.upstream_retry_max_attempts,
                         options=attempt_options,
@@ -15008,6 +15144,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     captcha_headless=self.captcha_headless,
                     captcha_timeout_ms=self.captcha_timeout_ms,
                     upstream_timeout_sec=self.upstream_timeout_sec,
+                    upstream_stall_timeout_sec=self.upstream_stall_timeout_sec,
                     retry_wait_sec=self.upstream_retry_wait_sec,
                     retry_attempts=self.upstream_retry_max_attempts,
                     options=attempt_options,
@@ -16779,6 +16916,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Stream idle timeout in seconds for upstream completions (default 300; panel setting applies unless set)",
     )
     parser.add_argument(
+        "--upstream-stall-timeout-sec",
+        type=float,
+        default=None,
+        help=(
+            "Abort and retry when an already-started stream produces no new "
+            "thinking/answer delta for this many seconds (default 60; 0 disables)"
+        ),
+    )
+    parser.add_argument(
         "--captcha-worker-idle-sec",
         type=float,
         default=900.0,
@@ -16942,6 +17088,16 @@ def main() -> int:
             captcha_headless=not args.headed,
             captcha_timeout_ms=args.captcha_timeout_ms,
             upstream_timeout_sec=args.upstream_timeout_sec or UPSTREAM_STREAM_TIMEOUT_SEC,
+            upstream_stall_timeout_sec=(
+                args.upstream_stall_timeout_sec
+                if args.upstream_stall_timeout_sec is not None
+                else float(
+                    local_settings.get(
+                        "upstream_stall_timeout_sec",
+                        DEFAULT_UPSTREAM_STALL_TIMEOUT_SEC,
+                    )
+                )
+            ),
             include_thinking=args.include_thinking,
             options=cli_options,
         )
@@ -16994,6 +17150,20 @@ def main() -> int:
             or UPSTREAM_STREAM_TIMEOUT_SEC
         )
         ProxyHandler.upstream_timeout_locked = bool(args.upstream_timeout_sec)
+        ProxyHandler.upstream_stall_timeout_sec = max(
+            0.0,
+            min(
+                MAX_UPSTREAM_STALL_TIMEOUT_SEC,
+                float(
+                    args.upstream_stall_timeout_sec
+                    if args.upstream_stall_timeout_sec is not None
+                    else local_settings.get(
+                        "upstream_stall_timeout_sec",
+                        DEFAULT_UPSTREAM_STALL_TIMEOUT_SEC,
+                    )
+                ),
+            ),
+        )
         ProxyHandler.upstream_retry_wait_sec = float(
             local_settings.get("upstream_retry_wait_sec", DEFAULT_UPSTREAM_RETRY_WAIT_SEC)
         )

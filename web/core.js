@@ -293,6 +293,7 @@
     const btnSaveSettings = $("btn-save-settings");
     const settingsStoreStatus = $("settings-store-status");
     const upstreamTimeoutInput = $("upstream-timeout-input");
+    const upstreamStallTimeoutInput = $("upstream-stall-timeout-input");
     const upstreamRetryWaitInput = $("upstream-retry-wait-input");
     const upstreamRetryAttemptsInput = $("upstream-retry-attempts-input");
     const historyMaxRecordsInput = $("history-max-records-input");

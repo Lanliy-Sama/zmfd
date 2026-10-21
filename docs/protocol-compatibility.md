@@ -29,7 +29,7 @@
 
 服务按本地账号池调度上游：每个 profile 最多 3 个生成，新请求优先使用默认账号，满载后按 `routing_order` 顺延到下一账号。账号池最多保留 64 个 profile；同 token/user_id 的重新导入原位更新，新增达到上限时返回 409 `profile_capacity_reached`。登录态进入内存/DPAPI 存储前统一限制 token 16 KiB、captcha 参数 64 KiB、其余字段 4 KiB。`Authorization`、`x-api-key` 和 `anthropic-version` 会被接受，以兼容常见 SDK；它们不是本地账号登录方式，也不会覆盖账号池选择。
 
-创建 chat 或流首阶段若收到实测瞬时错误（模型繁忙/限流、HTTP 429/500/502/503/504/520–525、“上游中断”、验证码失效），代理会清理空会话并按设置重试；繁忙等待按 attempt 指数退避（默认 3 秒、6 秒、12 秒……，上限 120 秒），避免多个子代理同时重试再次撞上并发上限。正文或 thinking 已输出、但尚未向客户端发出任何工具调用时，格式纠错仍可重放：替换轮只转发工具调用，已输出的正文/thinking 不会重复发送。工具调用已发出后不再重放，避免重复调用；鉴权和内容审核错误同样不参与重试。
+创建 chat 或流首阶段若收到实测瞬时错误（模型繁忙/限流、HTTP 429/500/502/503/504/520–525、“上游中断”、验证码失效），代理会清理空会话并按设置重试；繁忙等待按 attempt 指数退避（默认 3 秒、6 秒、12 秒……，上限 120 秒）。流已经开始输出后，如果连续 60 秒（可配置 0–300 秒，0 关闭）没有新的 thinking/正文 delta，静默看门狗会主动断开上游流并换会话重试，避免空等 socket 超时；重试轮不重放已经发给客户端的 thinking，只继续输出新的正文。正文或 thinking 已输出、但尚未向客户端发出任何工具调用时，格式纠错仍可重放：替换轮只转发工具调用，已输出的正文/thinking 不会重复发送。工具调用已发出后不再重放，避免重复调用；鉴权和内容审核错误同样不参与重试。
 
 工具输出转换采用“可恢复优先”的严格模式：同一显式工具块中出现未声明/被策略禁止的名称、不可转换的 arguments、缺失 schema 必填字段或模板占位符时，先保留同批中已正确序列化的调用，并记录 `tool_calls_partially_salvaged` 警告；只有整批都不可转换时才进入一次有界格式纠错。这样长程 Agent 的一个坏调用不会丢掉整轮工具执行。schema 声明为 object/array 的必填参数若为空（例如无参数 MCP 工具经 DeferredToolCall 传入空 `input`），会补成 `{}` / `[]` 而不是判定缺失；对象参数内部嵌套的 `<parameter name="...">` 会按 name 展平，直接 `<input>`/`<arguments>` 子节点也会并入参数；常驻工具误用 DeferredToolCall 的 `{input:{...}}` 外壳时会自动解包。确定纠错后先释放首轮完整字符串和流式分片列表，再开始替换流，防止两个最多 16 MiB 的合法输出同时驻留；正常解析完成后也立即清空原始分片。请求最多声明 128 个工具且定义总量不超过 1 MiB；单轮最多转换 128 个调用，每个 arguments 不超过 256 KiB。
 
@@ -55,7 +55,7 @@
 
 HTTP 管理查询统一经有界解析：最多 32 个字段，字段名最多 128 字符，解码后单值最多 4096 字符；本地/上游历史页码限制为 1–1000，历史关键字限制为 256 字符。查询超限返回 400；若上传端点尚未读取请求体便发现非法查询，响应显式关闭连接，防止残留正文污染下一条 keep-alive 请求。
 
-流式上游响应除单个未分帧事件 2 MiB 缓冲外，还限制整次原始 SSE 为 32 MiB、正文与思考合计为 16 MiB、事件数为 100,000。核心读取器和三个协议流式适配器分别计量，嵌入方替换核心生成器也不能绕过；超限使用 `UpstreamResponseTooLarge`，非流式映射为 502，已开始的 SSE 返回对应协议错误并停止，随后关闭生成器、释放账号槽位和清理上游 chat。上游只有出现抓包实证的 `data.done=true` 或 `[DONE]` 才算完整结束；提前 EOF 使用 `UpstreamStreamIncomplete`，零输出时可按既有 attempt 上限换 chat 重试，部分输出时禁止重放并强制把 chat 写入删除 journal，历史记录为 error。`runtime.upstream_responses` 分别公开 wire/output/event 拒绝及 `stream_incomplete_total` 计数，不包含响应内容。
+流式上游响应除单个未分帧事件 2 MiB 缓冲外，还限制整次原始 SSE 为 32 MiB、正文与思考合计为 16 MiB、事件数为 100,000。核心读取器和三个协议流式适配器分别计量，嵌入方替换核心生成器也不能绕过；超限使用 `UpstreamResponseTooLarge`，非流式映射为 502，已开始的 SSE 返回对应协议错误并停止，随后关闭生成器、释放账号槽位和清理上游 chat。上游只有出现抓包实证的 `data.done=true` 或 `[DONE]` 才算完整结束；提前 EOF 使用 `UpstreamStreamIncomplete`，零输出时可按既有 attempt 上限换 chat 重试；仅有 thinking 输出时，静默看门狗或提前 EOF 可在丢弃重试轮 thinking 后继续，已输出正文时禁止重放并强制把 chat 写入删除 journal，历史记录为 error。`runtime.upstream_responses` 分别公开 wire/output/event 拒绝、`stream_incomplete_total` 与 `stall_timeout_total` 计数，不包含响应内容。
 
 `POST /api/auth/browser-login`、兼容保留的 `/api/auth/captcha-refresh` 与新增的 `POST /api/auth/captcha/manual` 共用原子独占流程。并发请求不会同时拉起多个浏览器；未取得流程锁时返回 409 `auth_flow_busy`，响应中的 `flow` 只包含当前模式、阶段和更新时间。旧验证码端点仅在启用 fresh-captcha 且求解器为 `auto` 或 `browser` 时开放；纯 `happydom` 模式返回 409 `legacy_browser_captcha_disabled`。`captcha/manual` 不受 captcha mode 限制，始终打开可见窗口等待用户手动完成拼图，成功后写入指定 profile，并在 90 秒内供该账号的下一次请求优先使用。默认 on-demand 模式不会在 completion 前预求验证码，而是先使用 profile 已保存的值；只有显式 `--fresh-captcha` 才每请求预求，或由上游的 captcha 错误触发手动流程。当前 `zchat.z.ai` 返回 PUZZLE 挑战，无头自动路径会快速返回 `puzzle challenge requires manual completion`，不会空等完整超时。`GET /api/auth/browser-login/status` 从线程安全快照读取进度。浏览器启动最多等待 10 秒；首次授权页导航按 5 秒切片重试（总预算 60 秒），每个切片之间检查服务关闭信号；页面内登录态探测的网络请求最多等待 5 秒，避免异常网络使登录 handler 无期限阻塞。
 

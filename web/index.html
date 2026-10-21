@@ -719,6 +719,12 @@
                     <input id="upstream-timeout-input" class="input-custom" type="number" min="60" max="3600" step="30" value="300">
                   </div>
                   <div class="field-group">
+                    <label class="field-label" for="upstream-stall-timeout-input">上游静默看门狗（秒）
+                      <span class="control-desc">流已开始输出后，连续 N 秒没有新的 thinking/正文就主动断流并换会话重试；0 关闭，0–300，默认 60</span>
+                    </label>
+                    <input id="upstream-stall-timeout-input" class="input-custom" type="number" min="0" max="300" step="10" value="60">
+                  </div>
+                  <div class="field-group">
                     <label class="field-label" for="upstream-retry-wait-input">繁忙重试等待（秒）
                       <span class="control-desc">上游繁忙（MODEL_CONCURRENCY_LIMIT）时内部自动等待后换会话重试，错误不透传；0–120，默认 3</span>
                     </label>

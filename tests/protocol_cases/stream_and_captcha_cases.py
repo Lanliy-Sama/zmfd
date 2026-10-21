@@ -330,6 +330,187 @@ class StreamAndCaptchaCases:
         self.assertIn("RECOVERED", "".join(events))
         self.assertEqual(before + 1, app.upstream_response_status()["stream_incomplete_total"])
 
+    def test_stream_retries_eof_after_thinking_only_and_suppresses_replay(self) -> None:
+        state = fake_state()
+        calls = {"urlopen": 0, "chats": 0}
+        deleted: list[str] = []
+
+        class FakeResp:
+            def __init__(self, chunks: list[bytes]):
+                self.chunks = chunks
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(self.chunks)
+
+        first = [b'data: {"data":{"delta_content":"THINK_ONE","phase":"thinking"}}\n\n']
+        second = [
+            b'data: {"data":{"delta_content":"THINK_TWO","phase":"thinking"}}\n\n',
+            b'data: {"data":{"delta_content":"ANSWER","phase":"answer"}}\n\n',
+            b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+        ]
+        responses = [FakeResp(first), FakeResp(second)]
+
+        def fake_new_chat(_state, _prompt, options=None):
+            calls["chats"] += 1
+            return f"00000000-0000-0000-0000-{calls['chats']:012d}", f"u{calls['chats']}"
+
+        def fake_urlopen(_request, timeout=None):
+            index = calls["urlopen"]
+            calls["urlopen"] += 1
+            return responses[index]
+
+        real = (app.new_chat, app.delete_zai_chat, app.urlopen)
+        app.new_chat = fake_new_chat
+        app.delete_zai_chat = lambda _state, chat_id, **_kwargs: deleted.append(chat_id) or True
+        app.urlopen = fake_urlopen
+        try:
+            events = list(
+                self.original_stream(
+                    state,
+                    "thinking-only eof",
+                    options=app.ChatOptions(model="glm-5.3"),
+                    retry_wait_sec=0,
+                    retry_attempts=2,
+                )
+            )
+        finally:
+            app.new_chat, app.delete_zai_chat, app.urlopen = real
+        joined = "".join(events)
+        self.assertEqual(2, calls["urlopen"], "仅 thinking 后 EOF 应换会话重试")
+        self.assertIn("THINK_ONE", joined)
+        self.assertNotIn("THINK_TWO", joined, "重试轮 thinking 不应重复发送")
+        self.assertIn("ANSWER", joined)
+        self.assertEqual(["00000000-0000-0000-0000-000000000001"], deleted)
+
+    def test_stall_watchdog_retries_after_thinking_and_suppresses_replay(self) -> None:
+        state = fake_state()
+        release = threading.Event()
+        calls = {"urlopen": 0, "chats": 0}
+        deleted: list[str] = []
+
+        class FakeResp:
+            def __init__(self, chunks: list[bytes], block: bool = False):
+                self.chunks = chunks
+                self.block = block
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                yield from self.chunks
+                if self.block:
+                    release.wait(2)
+
+            def close(self):
+                release.set()
+
+        first = [b'data: {"data":{"delta_content":"THINK_ONE","phase":"thinking"}}\n\n']
+        second = [
+            b'data: {"data":{"delta_content":"THINK_TWO","phase":"thinking"}}\n\n',
+            b'data: {"data":{"delta_content":"ANSWER","phase":"answer"}}\n\n',
+            b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+        ]
+        responses = [FakeResp(first, block=True), FakeResp(second)]
+
+        def fake_new_chat(_state, _prompt, options=None):
+            calls["chats"] += 1
+            return f"00000000-0000-0000-0000-{calls['chats']:012d}", f"u{calls['chats']}"
+
+        def fake_urlopen(_request, timeout=None):
+            index = calls["urlopen"]
+            calls["urlopen"] += 1
+            return responses[index]
+
+        before = app.upstream_response_status()["stall_timeout_total"]
+        real = (app.new_chat, app.delete_zai_chat, app.urlopen, app.SSE_KEEPALIVE_INTERVAL_SECONDS)
+        app.new_chat = fake_new_chat
+        app.delete_zai_chat = lambda _state, chat_id, **_kwargs: deleted.append(chat_id) or True
+        app.urlopen = fake_urlopen
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0.02
+        try:
+            events = list(
+                self.original_stream(
+                    state,
+                    "stall retry",
+                    options=app.ChatOptions(model="glm-5.3"),
+                    retry_wait_sec=0,
+                    retry_attempts=2,
+                    upstream_stall_timeout_sec=0.1,
+                )
+            )
+        finally:
+            release.set()
+            app.new_chat, app.delete_zai_chat, app.urlopen, app.SSE_KEEPALIVE_INTERVAL_SECONDS = real
+        joined = "".join(events)
+        self.assertEqual(2, calls["urlopen"], "静默超时后应换会话重试一次")
+        self.assertEqual(2, calls["chats"])
+        self.assertIn("THINK_ONE", joined)
+        self.assertNotIn("THINK_TWO", joined, "重试轮的 thinking 不应重复发送")
+        self.assertIn("ANSWER", joined)
+        self.assertNotIn("上游静默", joined)
+        self.assertEqual(["00000000-0000-0000-0000-000000000001"], deleted)
+        self.assertEqual(before + 1, app.upstream_response_status()["stall_timeout_total"])
+
+    def test_stall_watchdog_aborts_after_answer_delta_without_retry(self) -> None:
+        state = fake_state()
+        release = threading.Event()
+        calls = {"urlopen": 0}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                yield b'data: {"data":{"delta_content":"THINK","phase":"thinking"}}\n\n'
+                yield b'data: {"data":{"delta_content":"PARTIAL","phase":"answer"}}\n\n'
+                release.wait(2)
+
+            def close(self):
+                release.set()
+
+        def fake_new_chat(_state, _prompt, options=None):
+            return "00000000-0000-0000-0000-0000000000b1", "u1"
+
+        def fake_urlopen(_request, timeout=None):
+            calls["urlopen"] += 1
+            return FakeResp()
+
+        real = (app.new_chat, app.delete_zai_chat, app.urlopen, app.SSE_KEEPALIVE_INTERVAL_SECONDS)
+        app.new_chat = fake_new_chat
+        app.delete_zai_chat = lambda _state, _chat_id, **_kwargs: True
+        app.urlopen = fake_urlopen
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0.02
+        try:
+            with self.assertRaises(app.UpstreamStreamIncomplete) as raised:
+                list(
+                    self.original_stream(
+                        state,
+                        "stall after answer",
+                        options=app.ChatOptions(model="glm-5.3"),
+                        retry_wait_sec=0,
+                        retry_attempts=2,
+                        upstream_stall_timeout_sec=0.1,
+                    )
+                )
+        finally:
+            release.set()
+            app.new_chat, app.delete_zai_chat, app.urlopen, app.SSE_KEEPALIVE_INTERVAL_SECONDS = real
+        self.assertTrue(raised.exception.protocol_content_emitted)
+        self.assertIn("静默", str(raised.exception))
+        self.assertEqual(1, calls["urlopen"], "已输出正文后不能重放")
+
     def test_stream_eof_after_partial_is_error_and_marks_cleanup_context(self) -> None:
         state = fake_state()
 
@@ -995,11 +1176,19 @@ class StreamAndCaptchaCases:
         defaults = app.local_settings_defaults()
         self.assertEqual(app.DEFAULT_UPSTREAM_RETRY_WAIT_SEC, defaults["upstream_retry_wait_sec"])
         self.assertEqual(app.DEFAULT_UPSTREAM_RETRY_ATTEMPTS, defaults["upstream_retry_max_attempts"])
+        self.assertEqual(
+            app.DEFAULT_UPSTREAM_STALL_TIMEOUT_SEC,
+            defaults["upstream_stall_timeout_sec"],
+        )
         normalized = app.normalize_local_settings(
             {"upstream_retry_wait_sec": 999, "upstream_retry_max_attempts": 99}
         )
         self.assertEqual(120.0, normalized["upstream_retry_wait_sec"])
         self.assertEqual(6, normalized["upstream_retry_max_attempts"])
+        normalized = app.normalize_local_settings({"upstream_stall_timeout_sec": 999})
+        self.assertEqual(app.MAX_UPSTREAM_STALL_TIMEOUT_SEC, normalized["upstream_stall_timeout_sec"])
+        normalized = app.normalize_local_settings({"upstream_stall_timeout_sec": -1})
+        self.assertEqual(0.0, normalized["upstream_stall_timeout_sec"])
         normalized = app.normalize_local_settings(
             {"upstream_retry_wait_sec": "bad", "upstream_retry_max_attempts": None}
         )

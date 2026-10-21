@@ -1081,6 +1081,7 @@
           includeThinkingToggle.checked = defaults.include_thinking !== false;
           autoDeleteToggle.checked = defaults.delete_chat_after_completion !== false;
           if (data.upstream_timeout_sec) upstreamTimeoutInput.value = data.upstream_timeout_sec;
+          if (data.upstream_stall_timeout_sec !== undefined) upstreamStallTimeoutInput.value = data.upstream_stall_timeout_sec;
           if (data.upstream_retry_wait_sec !== undefined) upstreamRetryWaitInput.value = data.upstream_retry_wait_sec;
           if (data.upstream_retry_max_attempts !== undefined) upstreamRetryAttemptsInput.value = data.upstream_retry_max_attempts;
           if (data.history_max_records !== undefined) historyMaxRecordsInput.value = data.history_max_records;
@@ -1096,7 +1097,7 @@
         $("info-token-fp").textContent = data.token_fp || "-";
         $("info-device-fp").textContent = data.device_id_fp || "-";
         $("dash-timeout").textContent = (data.upstream_timeout_sec || "-") + "s";
-        $("dash-retry").textContent = `wait ${data.upstream_retry_wait_sec ?? "-"}s × ${data.upstream_retry_max_attempts ?? "-"}`;
+        $("dash-retry").textContent = `wait ${data.upstream_retry_wait_sec ?? "-"}s × ${data.upstream_retry_max_attempts ?? "-"} · stall ${data.upstream_stall_timeout_sec ?? "-"}s`;
         const responseStore = data.response_store || {};
         $("info-response-store").textContent = responseStore.max_items
           ? `${responseStore.items || 0}/${responseStore.max_items} · ${formatBytes(responseStore.bytes || 0)}/${formatBytes(responseStore.max_bytes || 0)}`
