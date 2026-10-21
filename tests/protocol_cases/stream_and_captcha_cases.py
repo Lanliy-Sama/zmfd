@@ -388,6 +388,73 @@ class StreamAndCaptchaCases:
         self.assertIn("ANSWER", joined)
         self.assertEqual(["00000000-0000-0000-0000-000000000001"], deleted)
 
+    def test_stream_continues_after_prose_eof_without_repeating_it(self) -> None:
+        state = fake_state()
+        calls = {"urlopen": 0, "chats": 0}
+        deleted: list[str] = []
+        prompts: list[str] = []
+
+        class FakeResp:
+            def __init__(self, chunks: list[bytes]):
+                self.chunks = chunks
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(self.chunks)
+
+        first = [
+            b'data: {"data":{"delta_content":"THINK_ONE","phase":"thinking"}}\n\n',
+            b'data: {"data":{"delta_content":"PARTIAL","phase":"answer"}}\n\n',
+        ]
+        second = [
+            b'data: {"data":{"delta_content":"THINK_TWO","phase":"thinking"}}\n\n',
+            b'data: {"data":{"delta_content":"CONTINUED","phase":"answer"}}\n\n',
+            b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+        ]
+        responses = [FakeResp(first), FakeResp(second)]
+
+        def fake_new_chat(_state, _prompt, options=None):
+            calls["chats"] += 1
+            return f"00000000-0000-0000-0000-{calls['chats']:012d}", f"u{calls['chats']}"
+
+        def fake_urlopen(request, timeout=None):
+            payload = json.loads(request.data.decode("utf-8"))
+            prompts.append(payload["messages"][-1]["content"])
+            index = calls["urlopen"]
+            calls["urlopen"] += 1
+            return responses[index]
+
+        real = (app.new_chat, app.delete_zai_chat, app.urlopen)
+        app.new_chat = fake_new_chat
+        app.delete_zai_chat = lambda _state, chat_id, **_kwargs: deleted.append(chat_id) or True
+        app.urlopen = fake_urlopen
+        try:
+            events = list(
+                self.original_stream(
+                    state,
+                    "base prompt",
+                    options=app.ChatOptions(model="glm-5.3"),
+                    retry_wait_sec=0,
+                    retry_attempts=2,
+                )
+            )
+        finally:
+            app.new_chat, app.delete_zai_chat, app.urlopen = real
+        joined = "".join(events)
+        self.assertEqual(2, calls["urlopen"], "正文后 EOF 应续跑一次")
+        self.assertIn("PARTIAL", joined)
+        self.assertIn("CONTINUED", joined)
+        self.assertNotIn("THINK_TWO", joined, "续跑轮 thinking 不应重复发送")
+        self.assertNotIn("Continuation after an interrupted stream", prompts[0])
+        self.assertIn("Continuation after an interrupted stream", prompts[1])
+        self.assertIn("PARTIAL", prompts[1])
+        self.assertEqual(["00000000-0000-0000-0000-000000000001"], deleted)
+
     def test_stall_watchdog_retries_after_thinking_and_suppresses_replay(self) -> None:
         state = fake_state()
         release = threading.Event()
@@ -460,7 +527,83 @@ class StreamAndCaptchaCases:
         self.assertEqual(["00000000-0000-0000-0000-000000000001"], deleted)
         self.assertEqual(before + 1, app.upstream_response_status()["stall_timeout_total"])
 
-    def test_stall_watchdog_aborts_after_answer_delta_without_retry(self) -> None:
+    def test_stall_watchdog_continues_after_prose_stall(self) -> None:
+        state = fake_state()
+        release = threading.Event()
+        calls = {"urlopen": 0, "chats": 0}
+        deleted: list[str] = []
+        prompts: list[str] = []
+
+        class FakeResp:
+            def __init__(self, chunks: list[bytes], block: bool = False):
+                self.chunks = chunks
+                self.block = block
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                yield from self.chunks
+                if self.block:
+                    release.wait(2)
+
+            def close(self):
+                release.set()
+
+        first = [
+            b'data: {"data":{"delta_content":"THINK_ONE","phase":"thinking"}}\n\n',
+            b'data: {"data":{"delta_content":"PARTIAL","phase":"answer"}}\n\n',
+        ]
+        second = [
+            b'data: {"data":{"delta_content":"THINK_TWO","phase":"thinking"}}\n\n',
+            b'data: {"data":{"delta_content":"CONTINUED","phase":"answer"}}\n\n',
+            b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+        ]
+        responses = [FakeResp(first, block=True), FakeResp(second)]
+
+        def fake_new_chat(_state, _prompt, options=None):
+            calls["chats"] += 1
+            return f"00000000-0000-0000-0000-{calls['chats']:012d}", f"u{calls['chats']}"
+
+        def fake_urlopen(request, timeout=None):
+            payload = json.loads(request.data.decode("utf-8"))
+            prompts.append(payload["messages"][-1]["content"])
+            index = calls["urlopen"]
+            calls["urlopen"] += 1
+            return responses[index]
+
+        real = (app.new_chat, app.delete_zai_chat, app.urlopen, app.SSE_KEEPALIVE_INTERVAL_SECONDS)
+        app.new_chat = fake_new_chat
+        app.delete_zai_chat = lambda _state, chat_id, **_kwargs: deleted.append(chat_id) or True
+        app.urlopen = fake_urlopen
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0.02
+        try:
+            events = list(
+                self.original_stream(
+                    state,
+                    "base prompt",
+                    options=app.ChatOptions(model="glm-5.3"),
+                    retry_wait_sec=0,
+                    retry_attempts=2,
+                    upstream_stall_timeout_sec=0.1,
+                )
+            )
+        finally:
+            release.set()
+            app.new_chat, app.delete_zai_chat, app.urlopen, app.SSE_KEEPALIVE_INTERVAL_SECONDS = real
+        joined = "".join(events)
+        self.assertEqual(2, calls["urlopen"], "正文后静默应续跑一次")
+        self.assertIn("PARTIAL", joined)
+        self.assertIn("CONTINUED", joined)
+        self.assertNotIn("THINK_TWO", joined, "续跑轮 thinking 不应重复发送")
+        self.assertIn("Continuation after an interrupted stream", prompts[1])
+        self.assertIn("PARTIAL", prompts[1])
+        self.assertEqual(["00000000-0000-0000-0000-000000000001"], deleted)
+
+    def test_stall_watchdog_aborts_after_tool_markup_delta(self) -> None:
         state = fake_state()
         release = threading.Event()
         calls = {"urlopen": 0}
@@ -474,7 +617,23 @@ class StreamAndCaptchaCases:
 
             def __iter__(self):
                 yield b'data: {"data":{"delta_content":"THINK","phase":"thinking"}}\n\n'
-                yield b'data: {"data":{"delta_content":"PARTIAL","phase":"answer"}}\n\n'
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "data": {
+                                "delta_content": (
+                                    '<|DSML|tool_calls><|DSML|invoke name="Bash">'
+                                    '<|DSML|parameter name="command"><![CDATA[pwd]]></|DSML|parameter>'
+                                    "</|DSML|invoke></|DSML|tool_calls>"
+                                ),
+                                "phase": "answer",
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                ).encode("utf-8")
                 release.wait(2)
 
             def close(self):
@@ -497,7 +656,7 @@ class StreamAndCaptchaCases:
                 list(
                     self.original_stream(
                         state,
-                        "stall after answer",
+                        "stall after tool markup",
                         options=app.ChatOptions(model="glm-5.3"),
                         retry_wait_sec=0,
                         retry_attempts=2,
@@ -509,7 +668,7 @@ class StreamAndCaptchaCases:
             app.new_chat, app.delete_zai_chat, app.urlopen, app.SSE_KEEPALIVE_INTERVAL_SECONDS = real
         self.assertTrue(raised.exception.protocol_content_emitted)
         self.assertIn("静默", str(raised.exception))
-        self.assertEqual(1, calls["urlopen"], "已输出正文后不能重放")
+        self.assertEqual(1, calls["urlopen"], "已出现工具标记后不能续跑")
 
     def test_stream_eof_after_partial_is_error_and_marks_cleanup_context(self) -> None:
         state = fake_state()

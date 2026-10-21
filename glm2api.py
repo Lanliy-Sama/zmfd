@@ -6037,11 +6037,27 @@ def stream_zai_completion(
         # the client already received.  The retry still runs normally but its
         # thinking deltas are dropped from the downstream stream.
         suppress_thinking_on_retry = False
+        # After prose was emitted without any tool markup, retry as a
+        # continuation: keep the partial answer, suppress only thinking, and
+        # ask the model to continue from where the stream was cut.
+        continuation_retry = False
         while True:
             attempt += 1
             last_attempt = attempt >= retry_attempts
             last_delta_at: float | None = None
             answer_emitted = False
+            attempt_prompt = prompt
+            if continuation_retry:
+                partial_answer = "".join(answer_parts)[-4000:]
+                attempt_prompt = (
+                    prompt.rstrip()
+                    + "\n\n[Continuation after an interrupted stream]\n"
+                    + "The previous attempt already sent this visible text to the client:\n"
+                    + partial_answer
+                    + "\nContinue from the end of that text without repeating it. "
+                    + "If a tool call is still needed, emit the required DSML tool block now; "
+                    + "otherwise finish the answer."
+                )
             if cancel_check is not None:
                 cancel_check()
             attempt_files = files
@@ -6049,7 +6065,7 @@ def stream_zai_completion(
                 attempt_files = retry_files_factory()
             if own_chat:
                 try:
-                    chat_id, user_msg_id = new_chat(state, prompt, options=options)
+                    chat_id, user_msg_id = new_chat(state, attempt_prompt, options=options)
                 except Exception as exc:
                     # 创建会话阶段同样可能撞上瞬时繁忙/限流/验证码失效。
                     if not last_attempt and is_retryable_upstream_error(str(exc)):
@@ -6115,10 +6131,10 @@ def stream_zai_completion(
                 force_fresh_captcha = False
             if cancel_check is not None:
                 cancel_check()
-            query, signature = query_params(state, prompt, chat_id)
+            query, signature = query_params(state, attempt_prompt, chat_id)
             payload = completion_payload(
                 state,
-                prompt,
+                attempt_prompt,
                 chat_id,
                 user_msg_id,
                 assistant_msg_id=assistant_msg_id,
@@ -6202,14 +6218,20 @@ def stream_zai_completion(
                     )
 
                 def handle_stall() -> None:
-                    nonlocal retry_transient, retry_incomplete, retry_stall, suppress_thinking_on_retry
+                    nonlocal retry_transient, retry_incomplete, retry_stall, suppress_thinking_on_retry, continuation_retry
                     global _UPSTREAM_STALL_TIMEOUT_TOTAL
                     message = (
                         f"上游静默超过 {stall_timeout_sec:g} 秒，未收到新的 thinking/正文"
                     )
                     with _UPSTREAM_RESPONSE_STATS_LOCK:
                         _UPSTREAM_STALL_TIMEOUT_TOTAL += 1
-                    retrying = bool(not answer_emitted and not last_attempt and can_retry)
+                    can_retry_here = bool(not last_attempt and can_retry)
+                    continuation = bool(
+                        can_retry_here
+                        and answer_emitted
+                        and not tool_markup_attempted("".join(answer_parts))
+                    )
+                    retrying = bool(can_retry_here and (not answer_emitted or continuation))
                     log_event(
                         "upstream_stall_timeout",
                         level=logging.WARNING,
@@ -6222,12 +6244,15 @@ def stream_zai_completion(
                         content_emitted=content_emitted,
                         answer_emitted=answer_emitted,
                         retrying=retrying,
+                        continuation=continuation,
                     )
                     if retrying:
                         retry_transient = message
                         retry_incomplete = True
                         retry_stall = True
                         suppress_thinking_on_retry = True
+                        if continuation:
+                            continuation_retry = True
                         return
                     if isinstance(context_out, dict):
                         context_out["_stream_incomplete"] = True
@@ -6365,7 +6390,13 @@ def stream_zai_completion(
                         message = "上游中断：SSE 在完成标记前结束"
                         with _UPSTREAM_RESPONSE_STATS_LOCK:
                             _UPSTREAM_STREAM_INCOMPLETE_TOTAL += 1
-                        retrying = bool(not answer_emitted and not last_attempt and can_retry)
+                        can_retry_here = bool(not last_attempt and can_retry)
+                        continuation = bool(
+                            can_retry_here
+                            and answer_emitted
+                            and not tool_markup_attempted("".join(answer_parts))
+                        )
+                        retrying = bool(can_retry_here and (not answer_emitted or continuation))
                         log_event(
                             "upstream_stream_incomplete",
                             level=logging.WARNING,
@@ -6377,15 +6408,17 @@ def stream_zai_completion(
                             content_emitted=content_emitted,
                             answer_emitted=answer_emitted,
                             retrying=retrying,
+                            continuation=continuation,
                         )
                         if retrying:
                             retry_transient = message
                             retry_incomplete = True
-                            if content_emitted and not answer_emitted:
-                                # Thinking-only: the first attempt's thinking
-                                # already reached the client. Keep it and drop
-                                # the replacement turn's thinking.
+                            if content_emitted:
+                                # Thinking already reached the client; do not
+                                # replay the replacement turn's thinking.
                                 suppress_thinking_on_retry = True
+                            if continuation:
+                                continuation_retry = True
                         else:
                             if isinstance(context_out, dict):
                                 context_out["_stream_incomplete"] = True
@@ -6407,7 +6440,9 @@ def stream_zai_completion(
                             state,
                             chat_id,
                             reason=(
-                                "stall_timeout"
+                                "continuation"
+                                if continuation_retry
+                                else "stall_timeout"
                                 if retry_stall
                                 else "stream_incomplete"
                                 if retry_incomplete
@@ -6418,11 +6453,12 @@ def stream_zai_completion(
                     if captcha_rejected:
                         # 验证码被拒（超龄/一次性已耗）：无需等待，强制下一轮现场重解。
                         force_fresh_captcha = True
-                    answer_parts.clear()
+                    if not continuation_retry:
+                        answer_parts.clear()
+                        answer_chars = 0
                     if not suppress_thinking_on_retry:
                         thinking_parts.clear()
                         thinking_chars = 0
-                    answer_chars = 0
                     stream_budget.reset()
                     user_msg_id = None
                     assistant_msg_id = str(uuid.uuid4())
@@ -6442,6 +6478,8 @@ def stream_zai_completion(
                         reason=(
                             "captcha_rejected"
                             if captcha_rejected
+                            else "continuation"
+                            if continuation_retry
                             else "stall_timeout"
                             if retry_stall
                             else "stream_incomplete"
