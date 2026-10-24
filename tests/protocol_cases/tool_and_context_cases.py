@@ -1513,8 +1513,7 @@ class ToolAndContextCases:
         trace: dict[str, object] = {}
         prompt, files = app.prepare_protocol_upstream_request(fake_state(), request, trace_out=trace)
 
-        self.assertTrue(prompt.startswith(app.current_input_file_prompt(False)))
-        self.assertIn("Attachment URLs", prompt)
+        self.assertEqual(app.current_input_file_prompt(False), prompt)
         self.assertNotIn("Output integrity guard", prompt)
         self.assertEqual(1, len(files))
         self.assertEqual(1, len(self.uploads))
@@ -1753,7 +1752,7 @@ class ToolAndContextCases:
         self.assertFalse(poisoned_failure)
         self.assertFalse(poisoned_degraded)
 
-    def test_context_preload_waves_stop_thinking_and_chain_parent(self) -> None:
+    def test_context_preload_waves_read_then_chain_parent(self) -> None:
         original_stop = app.stop_zai_task
         original_cleanup = app._best_effort_delete_upstream_files
         calls: list[dict[str, object]] = []
@@ -1770,7 +1769,7 @@ class ToolAndContextCases:
             if index == 1:
                 kwargs["retry_files_factory"]()
             yield 'data: {"data":{"delta_content":"thinking","phase":"thinking"}}'
-            raise AssertionError("preload must close the stream after the first thinking delta")
+            yield 'data: {"data":{"phase":"tool_response","delta_content":"loaded","status":"completed"}}'
 
         app.stream_zai_completion = preload_stream
         app.stop_zai_task = lambda _state, assistant_id: stopped.append(assistant_id) or {"status": True}
@@ -1882,9 +1881,17 @@ class ToolAndContextCases:
             '"detail":"当前模型使用人数较多"}},"type":"chat:completion"}\n\n'
         ).encode("utf-8")
         responses = [
-            FakeResp([b'data: {"data":{"delta_content":"first thinking","phase":"thinking"}}\n\n']),
+            FakeResp([
+                b'data: {"data":{"delta_content":"first thinking","phase":"thinking"}}\n\n',
+                b'data: {"data":{"phase":"tool_response","delta_content":"loaded","status":"completed"}}\n\n',
+                b'data: {"data":{"phase":"done","done":true}}\n\n',
+            ]),
             FakeResp([busy]),
-            FakeResp([b'data: {"data":{"delta_content":"second thinking","phase":"thinking"}}\n\n']),
+            FakeResp([
+                b'data: {"data":{"delta_content":"second thinking","phase":"thinking"}}\n\n',
+                b'data: {"data":{"phase":"tool_response","delta_content":"loaded","status":"completed"}}\n\n',
+                b'data: {"data":{"phase":"done","done":true}}\n\n',
+            ]),
         ]
 
         def fake_new_chat(_state, _prompt, options=None):
@@ -1979,6 +1986,7 @@ class ToolAndContextCases:
                 }
             )
             yield 'data: {"data":{"delta_content":"thinking","phase":"thinking"}}'
+            yield 'data: {"data":{"phase":"tool_response","delta_content":"loaded","status":"completed"}}'
 
         app.upload_context_package_to_zai = fake_upload
         app._best_effort_delete_upstream_files = (

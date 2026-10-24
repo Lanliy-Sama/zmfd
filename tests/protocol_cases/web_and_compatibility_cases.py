@@ -80,7 +80,7 @@ class WebAndCompatibilityCases:
         self.assertIn("name: get_weather", forced_tools_text)
 
         prompt = app.file_mode_execution_prompt(tools, auto)
-        self.assertIn("The attached file holds the earlier conversation. Use WebFetch to read it through to its end", prompt)
+        self.assertIn("The attached file holds the earlier conversation. Use the Read tool to read it through to its end", prompt)
         self.assertIn("The other attached file or files enumerate the available function definitions", prompt)
         self.assertIn("read every numbered segment through its end before deciding or invoking", prompt)
         self.assertIn("Never issue a call with guessed or missing required values", prompt)
@@ -92,9 +92,9 @@ class WebAndCompatibilityCases:
         self.assertNotIn("Mandatory call:", prompt)
 
         preload_prompt = app.context_preload_prompt(1, 2, 10)
-        self.assertIn("use WebFetch", preload_prompt)
+        self.assertIn("use the Read tool", preload_prompt)
         self.assertIn("read every attached file through its end", preload_prompt)
-        self.assertIn("Do not answer the user's request or invoke a function yet", preload_prompt)
+        self.assertIn("Do not answer the user's request yet", preload_prompt)
 
         no_tools_prompt = app.file_mode_execution_prompt([], auto)
         self.assertEqual(app.current_input_file_prompt(False), no_tools_prompt)

@@ -5725,8 +5725,13 @@ def new_chat(state: HarState, prompt: str, options: ChatOptions | None = None) -
             "currentId": user_msg_id,
         },
         "tags": [],
-        "flags": [],
-        "features": [{"server": "tool_selector_h", "status": "hidden", "type": "tool_selector"}],
+        # 2026-10: 只有 general_agent 会话会把上传附件挂进沙箱并提供 Read 工具。
+        "flags": ["general_agent"],
+        "features": [
+            {"server": "web_search_h", "status": "hidden", "type": "web_search"},
+            {"server": "tool_selector_h", "status": "hidden", "type": "tool_selector"},
+            {"server": "hidden-thinking", "status": "hidden", "type": "hidden-thinking"},
+        ],
         "mcp_servers": [],
         "enable_thinking": options.enable_thinking,
         "reasoning_effort": options.reasoning_effort,
@@ -5734,7 +5739,7 @@ def new_chat(state: HarState, prompt: str, options: ChatOptions | None = None) -
         "message_version": 1,
         "extra": {},
         "timestamp": timestamp_ms,
-        "type": "default",
+        "type": "general_agent",
     }
     headers = {
         "Accept": "application/json",
@@ -5775,7 +5780,7 @@ def completion_payload(
         "web_search": False,
         "auto_web_search": options.auto_web_search,
         "preview_mode": True,
-        "flags": [],
+        "flags": ["general_agent"],
         "vlm_tools_enable": False,
         "vlm_web_search_enable": False,
         "vlm_website_mode": False,
@@ -6602,6 +6607,11 @@ def extract_delta_from_event(event: str) -> tuple[str, str]:
     # glm-5.3's stream emits the phase-transition markers (<think>/</think>) as
     # bare delta chunks; they are protocol artifacts, never model content.
     if delta.strip().lower() in {"<think>", "</think>"}:
+        return "", phase
+    # 2026-10 agent 模式新增 tool_call / tool_response / sandbox 等阶段：
+    # tool_response 的正文是附件内容，属于平台内部工具交互，绝不能作为回答
+    # 正文透传给客户端。
+    if phase and phase.lower() not in {"thinking", "answer"}:
         return "", phase
     return delta, phase
 
@@ -8840,16 +8850,16 @@ def split_generated_context_text(text: str, kind: str, model: str) -> list[str]:
 
 
 def current_input_file_prompt(has_tools_file: bool) -> str:
-    # 2026-10 上游变化：附件只能通过服务端的文件读取工具读取（不再直接可见于
-    # 输入框），因此所有附件提示词都显式要求模型使用该工具。
+    # 2026-10 上游变化：agent 会话把附件挂进沙箱（/home/z/my-project/upload/），
+    # 模型必须用 Read 工具读取正文；不再有可直接访问的内容 URL。
     prompt = (
-        "The attached file holds the earlier conversation. Use WebFetch to read it "
+        "The attached file holds the earlier conversation. Use the Read tool to read it "
         "through to its end and respond to the most recent user request directly."
     )
     prompt += (
         " The conversation may be split across multiple attachments; when segment headers are present, read every "
         "segment in numeric header order through its end before answering. Read every attachment with the "
-        "WebFetch before relying on its contents."
+        "Read tool before relying on its contents."
     )
     if has_tools_file:
         prompt += (
@@ -8969,7 +8979,7 @@ def apply_parallel_tool_setting(policy: ToolChoice, body: dict[str, Any]) -> Too
 
 
 COMPACTION_PROMPT_PREFIX = (
-    "The attached files contain the conversation to compact. Use WebFetch to read "
+    "The attached files contain the conversation to compact. Use the Read tool to read "
     "every segment in numeric header order through its end, then follow the instructions below.\n\n"
 )
 
@@ -11064,10 +11074,10 @@ def plan_staged_context_files(
 def context_preload_prompt(wave: int, waves: int, files: int) -> str:
     """Explain an intentionally incomplete context-loading turn to GLM-5.3."""
     return (
-        f"Context preload batch {wave}/{waves}: use WebFetch to read all {files} attached "
+        f"Context preload batch {wave}/{waves}: use the Read tool to read all {files} attached "
         "text files through their ends and retain their contents. When numbered segment headers are present, "
         "follow their numeric order and read every attached file through its end. Do not answer the user's request "
-        "or invoke a function yet; begin reasoning about the loaded context and wait for the continuation message "
+        "yet; begin reasoning about the loaded context and wait for the continuation message "
         "with the remaining files and final instructions."
     )
 
@@ -11077,7 +11087,7 @@ def staged_context_final_prompt(prompt: str, preload_waves: int) -> str:
     return (
         f"Continue from the {preload_waves} context preload turn(s) immediately before this message. Those turns "
         "were intentionally stopped during reasoning after loading earlier numbered segments. Combine that retained "
-        "context with every attachment on this message; read every attachment with WebFetch, then execute the "
+        "context with every attachment on this message; read every attachment with the Read tool, then execute the "
         "final instructions below.\n\n"
         + str(prompt or "")
     )
@@ -11098,40 +11108,6 @@ def _context_file_ids(files: Iterable[dict[str, Any]]) -> list[str]:
         if file_id and file_id not in file_ids:
             file_ids.append(file_id)
     return file_ids
-
-
-def context_attachment_url_lines(
-    files: list[dict[str, Any]],
-    trace: list[dict[str, Any]] | None = None,
-) -> str:
-    """Build the ordered segment-to-URL index the model fetches with WebFetch.
-
-    The upstream model can only read attachments through its server-side
-    WebFetch tool, so every generated transcript part is listed with a
-    fetchable URL instead of relying on the attachment preview alone.
-    """
-    if not files:
-        return ""
-    entries: list[str] = []
-    for index, item in enumerate(files):
-        file_obj = item.get("file") if isinstance(item.get("file"), dict) else item
-        file_id = str(file_obj.get("id") or item.get("id") or "").strip()
-        url = str(item.get("url") or (f"/api/v1/files/{file_id}" if file_id else "")).strip()
-        if url.startswith("/"):
-            url = BASE_URL.rstrip("/") + url
-        if not url:
-            continue
-        label = "attachment"
-        if trace is not None and index < len(trace):
-            info = trace[index]
-            kind = str(info.get("kind") or "context")
-            part = int(info.get("part") or 1)
-            parts = int(info.get("parts") or 1)
-            label = kind if parts <= 1 else f"{kind} segment {part}/{parts}"
-        entries.append(f"- {label}: {url}")
-    if not entries:
-        return ""
-    return "\nAttachment URLs (fetch every entry with WebFetch before using its contents):\n" + "\n".join(entries)
 
 
 def _update_context_trace_ref(item: dict[str, Any], ref: dict[str, Any]) -> None:
@@ -11238,9 +11214,7 @@ def preload_zai_context_waves(
                 uploaded_out.extend(initial_files)
             if owned_out is not None:
                 owned_out.extend(current_owned)
-            prompt = context_preload_prompt(index, total, len(trace)) + context_attachment_url_lines(
-                initial_files, trace
-            )
+            prompt = context_preload_prompt(index, total, len(trace))
             context: dict[str, Any] = {}
             current_files = list(initial_files)
 
@@ -11291,6 +11265,7 @@ def preload_zai_context_waves(
                 preserve_chat_on_generator_close=True,
             )
             semantic_started = False
+            saw_tool_response = False
             phase_seen = ""
             try:
                 for event in events:
@@ -11298,15 +11273,21 @@ def preload_zai_context_waves(
                     if error:
                         raise UpstreamRequestError(error)
                     delta, phase = extract_delta_from_event(event)
+                    phase_lower = phase.lower()
+                    # Agent mode consumes each batch through Read tool calls; a
+                    # completed tool response proves the attachment was read.
+                    if phase_lower == "tool_response":
+                        saw_tool_response = True
+                        continue
                     if not delta:
                         continue
-                    phase_seen = phase.lower()
-                    # Thinking is the official preload signal, but a model may
-                    # start the answer phase directly after reading the batch.
-                    # Either semantic delta proves the attachments were consumed;
-                    # stop the turn and continue instead of failing the request.
-                    semantic_started = phase_seen in {"thinking", "answer"}
-                    break
+                    phase_seen = phase_lower
+                    # Keep consuming after thinking: the Read tool calls and
+                    # their responses follow it, and only the answer phase (or
+                    # the natural end of a read-only turn) ends the wave.
+                    if phase_lower == "answer":
+                        semantic_started = True
+                        break
                 assistant_id = str(context.get("assistant_message_id") or "").strip()
                 active_chat_id = str(context.get("chat_id") or chat_id or "").strip()
                 if not assistant_id or not active_chat_id:
@@ -11321,7 +11302,7 @@ def preload_zai_context_waves(
                     files=len(initial_files),
                     phase=phase_seen or "none",
                 )
-                if not semantic_started:
+                if not semantic_started and not saw_tool_response:
                     raise UpstreamRequestError("context preload did not produce a semantic delta")
                 if phase_seen == "answer":
                     log_event(
@@ -11473,11 +11454,7 @@ def prepare_protocol_upstream_request(
             trace_out["context_files"] = generated_trace
         # History is already externalized in the uploaded transcript. Like the reference,
         # only tools callable in this turn decide whether the live prompt needs the guard.
-        return apply_output_integrity_guard(
-            request.execution_prompt + context_attachment_url_lines(generated_files, generated_trace),
-            effective_tools,
-            [],
-        ), files
+        return apply_output_integrity_guard(request.execution_prompt, effective_tools, []), files
     effective_tools = tools_allowed_by_policy(request.tools, request.tool_choice)
     return apply_output_integrity_guard(request.execution_prompt, effective_tools, request.messages), files
 
@@ -12632,7 +12609,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 owned_context_refs.extend(current_final_owned)
                 final_files = current_final_generated + user_files
-                prompt = prompt + context_attachment_url_lines(current_final_generated, final_trace)
                 record_context_upload_success(state.user_id)
             except Exception as exc:
                 if staged_chat_id:
