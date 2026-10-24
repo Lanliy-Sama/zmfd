@@ -919,13 +919,17 @@ _SSE_HEARTBEATS_SENT_TOTAL = 0
 _SSE_HEARTBEAT_ERRORS_TOTAL = 0
 UPLOAD_STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_CONTEXT_FILE_BYTES = 4 * 1024 * 1024
-# Generated history/tool transcripts are uploaded in 50 KiB segments. The
+# Generated history/tool transcripts are uploaded in 1 MiB segments. The
 # 512-byte reserve carries the segment header so every file, header included,
-# stays at or below 50 KiB. Keeping one uniform boundary also lets the
-# multi-wave preload path serve million-token contexts on every model.
-CONTEXT_FILE_PART_BYTES = 50 * 1024
-# Backward-compatible name: earlier releases documented the GLM-5.3 boundary
-# as 49 KiB minus a 512-byte header.
+# stays at or below 1 MiB. The old 50 KiB boundary came from native attachment
+# preview truncation (GLM-5.3 cut off from ~49 KiB); since 2026-10 the upstream
+# reads attachments through its server-side file-reading tool instead, so a
+# much larger boundary is safe. One uniform value keeps the bounded multi-wave
+# preload path working for million-token contexts on every model.
+CONTEXT_FILE_PART_BYTES = 1024 * 1024
+# Backward-compatible name: earlier releases documented the GLM-5.3 native
+# boundary (49 KiB minus a 512-byte header); the alias now follows the unified
+# tool-era boundary.
 GLM53_CONTEXT_FILE_PART_BYTES = CONTEXT_FILE_PART_BYTES
 CONTEXT_FILE_PART_HEADER_RESERVE_BYTES = 512
 # The upstream composer only accepts a small inline prompt safely (empirically
@@ -4095,10 +4099,10 @@ HISTORY_PROMPT_CHARS = 8_000
 HISTORY_MSG_CHARS = 6_000
 HISTORY_MESSAGES_MAX = 30
 HISTORY_CONTEXT_CHARS = 16_000
-# A million-token protocol request can produce roughly one hundred 50 KiB
-# segments after transcript headers/tool guidance are added. Keep the complete
-# delivery manifest while remaining below the 16 MiB detail-file budget even
-# with JSON escaping overhead.
+# A full 32 MiB protocol request can produce roughly thirty 1 MiB segments
+# after transcript headers/tool guidance are added. Keep the complete delivery
+# manifest while remaining below the 16 MiB detail-file budget even with JSON
+# escaping overhead.
 HISTORY_CONTEXT_FILES_MAX = 192
 HISTORY_CONTEXT_FILE_CHARS = 80_000
 HISTORY_FINAL_CHARS = 40_000
@@ -8257,7 +8261,7 @@ CONTEXT_FILE_CACHE_MAX_ITEMS = 512
 CONTEXT_FILE_INFLIGHT_WAIT_SECONDS = 30.0
 _CONTEXT_FILE_CACHE: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
 # Identical context parts can be requested by concurrent tool turns. Wait for
-# the first upload instead of sending the same 50 KiB file twice upstream.
+# the first upload instead of sending the same context file twice upstream.
 _CONTEXT_FILE_INFLIGHT: dict[tuple[str, str], threading.Event] = {}
 _CONTEXT_FILE_CACHE_LOCK = threading.RLock()
 # 上传失败降级（对齐 ds2api 参考实现）：同一账号连续 N 次上下文文件上传失败后，
@@ -8762,9 +8766,11 @@ def build_tools_transcript(tools: list[dict[str, Any]], policy: ToolChoice | Non
 def generated_context_file_part_limit(model: str) -> int:
     """Return the uniform readable size for generated text files.
 
-    All models use the same 50 KiB file boundary; the 512-byte header reserve
-    keeps every segment at or below it. The resulting part count is handled by
-    the bounded multi-wave path instead of one oversized attachment.
+    All models use the same 1 MiB file boundary; since the upstream reads
+    attachments through its server-side file-reading tool the old 50 KiB
+    native-preview boundary no longer applies. The 512-byte header reserve keeps
+    every segment at or below it, and the resulting part count is still handled
+    by the bounded multi-wave path instead of one oversized attachment.
     """
     del model
     return CONTEXT_FILE_PART_BYTES
@@ -10780,7 +10786,7 @@ def _context_file_begin_upload(
     """Return a cached ref, or register this caller as the single uploader.
 
     Concurrent turns with the same account and identical segment content wait
-    for the first upload instead of sending the same 50 KiB file twice. If the
+    for the first upload instead of sending the same context file twice. If the
     first uploader fails, one waiter takes ownership and retries it.
     """
     while True:

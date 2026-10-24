@@ -1521,14 +1521,14 @@ class ToolAndContextCases:
         self.assertIn("[tool]", self.uploads[0][1])
         self.assertNotIn(app.TOOLS_TRANSCRIPT_INTRO, self.uploads[0][1])
 
-    def test_glm53_splits_generated_history_and_tools_below_readable_boundary(self) -> None:
+    def test_glm53_splits_generated_history_below_readable_boundary(self) -> None:
         latest_request = "LATEST_USER_REQUEST_MUST_SURVIVE"
         request = app.normalize_openai_chat_request(
             {
                 "model": "glm-5.3-forcehistory",
                 "messages": [
                     {"role": "system", "content": "system rules"},
-                    {"role": "user", "content": "old context\n" + ("历史填充。" * 18000)},
+                    {"role": "user", "content": "old context\n" + ("历史填充。" * (app.CONTEXT_FILE_PART_BYTES * 5 // 30))},
                     {"role": "assistant", "content": "previous answer"},
                     {"role": "user", "content": latest_request},
                 ],
@@ -1537,7 +1537,7 @@ class ToolAndContextCases:
                         "type": "function",
                         "function": {
                             "name": "large_schema_tool",
-                            "description": "D" * 60000,
+                            "description": "D" * (app.MAX_TOOL_DEFINITIONS_BYTES // 2),
                             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
                         },
                     }
@@ -1560,7 +1560,7 @@ class ToolAndContextCases:
         history_parts = [item for item in context_files if item["kind"] == "history"]
         tools_parts = [item for item in context_files if item["kind"] == "tools"]
         self.assertGreater(len(history_parts), 1)
-        self.assertGreater(len(tools_parts), 1)
+        self.assertEqual(1, len(tools_parts))
         self.assertEqual(list(range(1, len(history_parts) + 1)), [item["part"] for item in history_parts])
         self.assertTrue(all(item["parts"] == len(history_parts) for item in history_parts))
         self.assertIn(latest_request, history_parts[-1]["content"])
@@ -1568,12 +1568,14 @@ class ToolAndContextCases:
             f"conversation history segment {len(history_parts)}/{len(history_parts)}",
             history_parts[-1]["content"],
         )
-        self.assertIn("function definitions segment 1/", tools_parts[0]["content"])
+        self.assertIn(app.TOOLS_TRANSCRIPT_INTRO, tools_parts[0]["content"])
 
+        padding_unit = " neutral schema padding"
+        padding_reps = max(1, app.CONTEXT_FILE_PART_BYTES // (16 * len(padding_unit)) + 8)
         moderate_tools = [
             {
                 "name": f"moderate_tool_{index:02d}",
-                "description": "Synthetic definition." + (" neutral schema padding" * 140),
+                "description": "Synthetic definition." + padding_unit * padding_reps,
                 "parameters": {"type": "object", "properties": {"input": {"type": "string"}}},
             }
             for index in range(16)
@@ -1581,7 +1583,7 @@ class ToolAndContextCases:
         moderate_text = app.build_tools_transcript(moderate_tools, app.ToolChoice(mode="auto"))
         moderate_parts = app.split_generated_context_text(moderate_text, "tools", "glm-5.3")
         self.assertGreater(len(moderate_text.encode("utf-8")), app.CONTEXT_FILE_PART_BYTES)
-        self.assertEqual(2, len(moderate_parts), "50 KiB edge should keep this tool package to two files")
+        self.assertEqual(2, len(moderate_parts), "one-boundary edge should keep this tool package to two files")
         self.assertTrue(
             all(len(part.encode("utf-8")) <= app.CONTEXT_FILE_PART_BYTES for part in moderate_parts)
         )
@@ -1625,7 +1627,10 @@ class ToolAndContextCases:
         self.assertEqual(["tools"], [item["kind"] for item in final_tool_trace])
 
     def test_million_token_scale_context_plans_bounded_preload_waves(self) -> None:
-        text = ("token " * 1000 + "\n") * 700
+        # Size the prompt past the attachment cap so the wave path is exercised
+        # at the current segment boundary.
+        reps = max(700, (app.CONTEXT_FILE_PART_BYTES // 6000 + 1) * (app.ZAI_MAX_COMPLETION_FILES + 3))
+        text = ("token " * 1000 + "\n") * reps
         request = app.normalize_openai_chat_request(
             {"model": "glm-5.3-forcehistory", "messages": [{"role": "user", "content": text}]},
             False,
@@ -1637,7 +1642,7 @@ class ToolAndContextCases:
         self.assertEqual([], files)
         self.assertTrue(trace["deferred_context_upload"])
         parts = trace["context_files"]
-        self.assertGreater(len(parts), 50)
+        self.assertGreater(len(parts), app.ZAI_MAX_COMPLETION_FILES)
         self.assertTrue(
             all(len(str(item["content"]).encode("utf-8")) <= app.CONTEXT_FILE_PART_BYTES for item in parts)
         )
@@ -1646,7 +1651,7 @@ class ToolAndContextCases:
             parts,
             [],
         )
-        self.assertGreater(len(waves), 5)
+        self.assertGreater(len(waves), 0)
         self.assertTrue(all(len(wave) <= app.ZAI_MAX_COMPLETION_FILES for wave, _trace in waves))
         self.assertEqual(
             len(parts),
@@ -1659,7 +1664,7 @@ class ToolAndContextCases:
         request = app.normalize_openai_chat_request(
             {
                 "model": "glm-5.3-forcehistory",
-                "messages": [{"role": "user", "content": "H" * 600_000}],
+                "messages": [{"role": "user", "content": "H" * (app.CONTEXT_FILE_PART_BYTES * (app.ZAI_MAX_COMPLETION_FILES + 2))}],
             },
             False,
         )
@@ -2069,7 +2074,7 @@ class ToolAndContextCases:
                 "/v1/chat/completions",
                 {
                     "model": "glm-5.3-forcehistory",
-                    "messages": [{"role": "user", "content": "H" * 600_000}],
+                    "messages": [{"role": "user", "content": "H" * (app.CONTEXT_FILE_PART_BYTES * (app.ZAI_MAX_COMPLETION_FILES + 2))}],
                     "stream": False,
                     "delete_chat_after_completion": False,
                     "mode": "continue",
@@ -2122,7 +2127,7 @@ class ToolAndContextCases:
                 "/v1/chat/completions",
                 {
                     "model": "glm-5.3-forcehistory",
-                    "messages": [{"role": "user", "content": "H" * 600_000}],
+                    "messages": [{"role": "user", "content": "H" * (app.CONTEXT_FILE_PART_BYTES * (app.ZAI_MAX_COMPLETION_FILES + 2))}],
                     "stream": False,
                 },
             )
@@ -2203,8 +2208,8 @@ class ToolAndContextCases:
         self.assertNotIn(filler[:200], str(captured["prompt"]))
         self.assertEqual(1, len(captured["files"]))
 
-    def test_generated_context_parts_are_50_kib_for_every_model(self) -> None:
-        self.assertEqual(50 * 1024, app.CONTEXT_FILE_PART_BYTES)
+    def test_generated_context_parts_are_1_mib_for_every_model(self) -> None:
+        self.assertEqual(1024 * 1024, app.CONTEXT_FILE_PART_BYTES)
         self.assertEqual(app.CONTEXT_FILE_PART_BYTES, app.GLM53_CONTEXT_FILE_PART_BYTES)
         for model in ("glm-5.3", "glm-5.5", "x-preview-l", "GLM-5-Turbo"):
             self.assertEqual(app.CONTEXT_FILE_PART_BYTES, app.generated_context_file_part_limit(model))
@@ -2231,17 +2236,17 @@ class ToolAndContextCases:
         status, raw = self.request("POST", "/v1/chat/completions", payload)
         self.assertEqual(200, status, raw[:500])
 
-    def test_all_models_split_generated_context_at_50kib(self) -> None:
+    def test_all_models_split_generated_context_at_1mib(self) -> None:
         request = app.normalize_openai_chat_request(
             {
                 "model": "glm-5.5-forcehistory",
-                "messages": [{"role": "user", "content": "H" * 70000}],
+                "messages": [{"role": "user", "content": "H" * (app.CONTEXT_FILE_PART_BYTES + 4096)}],
                 "tools": [
                     {
                         "type": "function",
                         "function": {
                             "name": "large_schema_tool",
-                            "description": "D" * 60000,
+                            "description": "D" * (app.MAX_TOOL_DEFINITIONS_BYTES // 2),
                             "parameters": {"type": "object"},
                         },
                     }
@@ -2254,19 +2259,17 @@ class ToolAndContextCases:
 
         _prompt, files = app.prepare_protocol_upstream_request(fake_state(), request, trace_out=trace)
 
-        self.assertEqual(4, len(files))
+        self.assertEqual(3, len(files))
         self.assertEqual(
-            [("history", 1), ("history", 2), ("tools", 1), ("tools", 2)],
+            [("history", 1), ("history", 2), ("tools", 1)],
             [(item["kind"], item["part"]) for item in trace["context_files"]],
         )
         self.assertTrue(
             all(len(content.encode("utf-8")) <= app.CONTEXT_FILE_PART_BYTES for _name, content in self.uploads)
         )
-        self.assertTrue(
-            all(item["parts"] == 2 for item in trace["context_files"] if item["kind"] in {"history", "tools"})
-        )
-        self.assertIn("function definitions segment 1/2", self.uploads[0][1])
-        self.assertIn("conversation history segment 1/2", self.uploads[2][1])
+        self.assertEqual([2, 2, 1], [item["parts"] for item in trace["context_files"]])
+        self.assertIn(app.TOOLS_TRANSCRIPT_INTRO, self.uploads[0][1])
+        self.assertIn("conversation history segment 1/2", self.uploads[1][1])
 
     def test_output_integrity_guard_scope(self) -> None:
         # 无工具且无 tool 历史：不加守卫（避免多余指纹）；有工具：守卫前置且不重复
