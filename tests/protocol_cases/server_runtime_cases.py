@@ -22,7 +22,7 @@ class ServerRuntimeCases:
             status, raw = self.request(
                 "POST",
                 "/v1/chat/completions",
-                {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}]},
+                {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}]},
             )
             data = json.loads(raw)
             self.assertEqual(200, status)
@@ -35,7 +35,7 @@ class ServerRuntimeCases:
                 "POST",
                 "/v1/chat/completions",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": "hi"}],
                     "include_thinking": False,
                 },
@@ -47,7 +47,7 @@ class ServerRuntimeCases:
             status, raw = self.request(
                 "POST",
                 "/v1/chat/completions",
-                {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}], "stream": True},
             )
             self.assertEqual(200, status)
             self.assertIn('"reasoning_content"', raw)
@@ -57,7 +57,7 @@ class ServerRuntimeCases:
             status, raw = self.request(
                 "POST",
                 "/anthropic/v1/messages",
-                {"model": "glm-5.2", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]},
+                {"model": "glm-5.5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]},
             )
             data = json.loads(raw)
             self.assertEqual(200, status)
@@ -70,7 +70,7 @@ class ServerRuntimeCases:
                 "POST",
                 "/anthropic/v1/messages",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "max_tokens": 100,
                     "messages": [{"role": "user", "content": "hi"}],
                     "include_thinking": False,
@@ -83,7 +83,7 @@ class ServerRuntimeCases:
             status, raw = self.request(
                 "POST",
                 "/v1/responses",
-                {"model": "glm-5.2", "input": "hi"},
+                {"model": "glm-5.5", "input": "hi"},
             )
             data = json.loads(raw)
             self.assertEqual(200, status)
@@ -117,7 +117,7 @@ class ServerRuntimeCases:
         status, raw = self.request(
             "POST",
             "/v1/chat/completions",
-            {"model": "glm-5.2", "messages": [{"role": "user", "content": "北京天气"}], "tools": openai_tools},
+            {"model": "glm-5.5", "messages": [{"role": "user", "content": "北京天气"}], "tools": openai_tools},
         )
         chat = json.loads(raw)
         self.assertEqual(200, status)
@@ -148,7 +148,7 @@ class ServerRuntimeCases:
             "POST",
             "/v1/responses",
             {
-                "model": "glm-5.2-forcehistory",
+                "model": "glm-5.5-forcehistory",
                 "previous_response_id": response_id,
                 "input": "继续，根据刚才的结果补充一句。",
                 "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}],
@@ -538,7 +538,7 @@ class ServerRuntimeCases:
             status, raw = self.request(
                 "POST",
                 "/api/settings",
-                {"settings": {"model": "glm-5.2", "include_thinking": True}},
+                {"settings": {"model": "glm-5.5", "include_thinking": True}},
             )
             self.assertEqual(500, status, raw[:500])
             payload = json.loads(raw)
@@ -611,7 +611,7 @@ class ServerRuntimeCases:
 
         app.save_local_settings = fake_save
         threads = [
-            threading.Thread(target=worker, args=("glm-5.2",)),
+            threading.Thread(target=worker, args=("glm-5.5",)),
             threading.Thread(target=worker, args=("glm-5.3",)),
         ]
         try:
@@ -756,7 +756,7 @@ class ServerRuntimeCases:
         data = json.loads(raw)
         self.assertTrue(data["ok"])
         self.assertTrue(data["persisted"])
-        self.assertEqual("glm-5.2", data["settings"]["model"])
+        self.assertEqual("glm-5.5", data["settings"]["model"])
         self.assertTrue(data["settings"]["auto_web_search"])
         self.assertFalse(data["settings"]["enable_thinking"])
         self.assertEqual("high", data["settings"]["reasoning_effort"])
@@ -769,7 +769,7 @@ class ServerRuntimeCases:
         self.assertEqual(200, status)
         status_data = json.loads(raw)
         defaults = status_data["default_options"]
-        self.assertEqual("glm-5.2", defaults["model"])
+        self.assertEqual("glm-5.5", defaults["model"])
         self.assertTrue(defaults["include_thinking"])
         self.assertEqual(600, status_data["upstream_timeout_sec"])
         self.assertTrue(status_data["settings_store"]["persisted"])
@@ -792,7 +792,7 @@ class ServerRuntimeCases:
             loaded, loaded_saved_at, error = app.load_local_settings(path)
             self.assertEqual("", error)
             self.assertEqual(saved_at, loaded_saved_at)
-            self.assertEqual("glm-5.2", loaded["model"])
+            self.assertEqual("glm-5.5", loaded["model"])
             self.assertTrue(loaded["auto_web_search"])
             self.assertFalse(loaded["enable_thinking"])
             self.assertEqual("high", loaded["reasoning_effort"])
@@ -913,10 +913,10 @@ class ServerRuntimeCases:
         app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0
         try:
             requests = [
-                ("/v1/chat/completions", {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
-                ("/v1/responses", {"model": "glm-5.2", "input": "hi", "stream": True}),
-                ("/v1/messages", {"model": "glm-5.2", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}], "stream": True}),
-                ("/api/chat", {"model": "glm-5.2", "message": "hi", "stream": True}),
+                ("/v1/chat/completions", {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                ("/v1/responses", {"model": "glm-5.5", "input": "hi", "stream": True}),
+                ("/v1/messages", {"model": "glm-5.5", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                ("/api/chat", {"model": "glm-5.5", "message": "hi", "stream": True}),
             ]
             results = [self.request("POST", path, body) for path, body in requests]
         finally:
@@ -944,19 +944,19 @@ class ServerRuntimeCases:
             requests = [
                 (
                     "/v1/chat/completions",
-                    {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                    {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}], "stream": True},
                 ),
-                ("/v1/responses", {"model": "glm-5.2", "input": "hi", "stream": True}),
+                ("/v1/responses", {"model": "glm-5.5", "input": "hi", "stream": True}),
                 (
                     "/v1/messages",
                     {
-                        "model": "glm-5.2",
+                        "model": "glm-5.5",
                         "max_tokens": 32,
                         "messages": [{"role": "user", "content": "hi"}],
                         "stream": True,
                     },
                 ),
-                ("/api/chat", {"model": "glm-5.2", "message": "hi", "stream": True}),
+                ("/api/chat", {"model": "glm-5.5", "message": "hi", "stream": True}),
             ]
             results = [self.request("POST", path, body) for path, body in requests]
         finally:
@@ -993,7 +993,7 @@ class ServerRuntimeCases:
             status, raw = self.request(
                 "POST",
                 "/v1/chat/completions",
-                {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}], "stream": True},
             )
         finally:
             app.prepare_protocol_upstream_request = original_prepare
@@ -1014,7 +1014,7 @@ class ServerRuntimeCases:
             status, raw = self.request(
                 "POST",
                 "/v1/chat/completions",
-                {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}], "stream": True},
             )
         finally:
             app.prepare_protocol_upstream_request = original_prepare
@@ -1141,7 +1141,7 @@ class ServerRuntimeCases:
                     self.original_stream(
                         state,
                         "hi",
-                        options=app.ChatOptions(model="glm-5.2"),
+                        options=app.ChatOptions(model="glm-5.5"),
                         context_out=context,
                         cancel_check=cancel_after_chat,
                     )
@@ -1187,7 +1187,7 @@ class ServerRuntimeCases:
                     self.original_stream(
                         state,
                         "hi",
-                        options=app.ChatOptions(model="glm-5.2"),
+                        options=app.ChatOptions(model="glm-5.5"),
                         cancel_check=cancel_after_connect,
                     )
                 )
@@ -2117,7 +2117,7 @@ class ServerRuntimeCases:
                         create_chat=False,
                         chat_id="00000000-0000-0000-0000-000000000001",
                         user_msg_id="00000000-0000-0000-0000-000000000002",
-                        options=app.ChatOptions(model="glm-5.2", delete_chat_after_completion=False),
+                        options=app.ChatOptions(model="glm-5.5", delete_chat_after_completion=False),
                         cancel_check=cancel_check,
                     )
                 )

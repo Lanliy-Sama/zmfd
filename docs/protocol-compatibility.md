@@ -25,7 +25,7 @@
 | Anthropic Messages | `POST /anthropic/v1/messages` | `/v1/messages`、`/messages` | `stream: true` |
 | Anthropic token 估算 | `POST /anthropic/v1/messages/count_tokens` | `/v1/messages/count_tokens`、`/messages/count_tokens` | 无 |
 
-模型发现返回八条本地路由：`glm-5.3`、`x-preview-l`、`GLM-5-Turbo`、`glm-5.2` 及各自的 `-forcehistory` 变体。常见 `gpt-*`、`codex-*`、`o*` 和 `claude-*` 仍可作为输入别名，默认映射到 `glm-5.3`；`glm-5.3-flash` / `glm5.3flash` / `flash` 映射到 `x-preview-l`，旧 `glm-5.1` 映射到 `glm-5.2`。响应中的 `model` 保留原始请求名，避免影响 SDK 的模型分支逻辑。
+模型发现返回八条本地路由：`glm-5.3`、`x-preview-l`、`GLM-5-Turbo`、`glm-5.5` 及各自的 `-forcehistory` 变体。常见 `gpt-*`、`codex-*`、`o*` 和 `claude-*` 仍可作为输入别名，默认映射到 `glm-5.3`；`glm-5.3-flash` / `glm5.3flash` / `flash` 映射到 `x-preview-l`，旧 `glm-5.1` / `glm-5.2` 映射到 `glm-5.5`。响应中的 `model` 保留原始请求名，避免影响 SDK 的模型分支逻辑。
 
 服务按本地账号池调度上游：每个 profile 最多 3 个生成，新请求优先使用默认账号，满载后按 `routing_order` 顺延到下一账号。账号池最多保留 64 个 profile；同 token/user_id 的重新导入原位更新，新增达到上限时返回 409 `profile_capacity_reached`。登录态进入内存/DPAPI 存储前统一限制 token 16 KiB、captcha 参数 64 KiB、其余字段 4 KiB。`Authorization`、`x-api-key` 和 `anthropic-version` 会被接受，以兼容常见 SDK；它们不是本地账号登录方式，也不会覆盖账号池选择。
 

@@ -1,6 +1,6 @@
 # glm2api
 
-本目录是可独立启动的本地 Web 版 GLM 反代工具。公开模型路由固定为八项：`glm-5.3`、`x-preview-l`（即 GLM-5.3-Flash）、`GLM-5-Turbo`（注意大小写，上游 ID 敏感）、`glm-5.2`，以及各自的 `-forcehistory` 变体。GLM-5.1 已从官网下架（上游 500），旧 ID 自动重映射到 `glm-5.2`。协议入口支持约百万级 token 的上下文：JSON 正文预算 32 MiB，生成分片按 50 KiB 打包，超过 4K 估算 token 的非 forcehistory 请求会自动切换为附件转写模式。
+本目录是可独立启动的本地 Web 版 GLM 反代工具。公开模型路由固定为八项：`glm-5.3`、`x-preview-l`（即 GLM-5.3-Flash）、`GLM-5-Turbo`（注意大小写，上游 ID 敏感）、`glm-5.5`，以及各自的 `-forcehistory` 变体。GLM-5.1 已从官网下架（上游 500），GLM-5.2 将随 GLM-5.5 发布退场；两个旧 ID 都自动重映射到 `glm-5.5`。协议入口支持约百万级 token 的上下文：JSON 正文预算 32 MiB，生成分片按 50 KiB 打包，超过 4K 估算 token 的非 forcehistory 请求会自动切换为附件转写模式。
 
 ## 一键启动
 
@@ -114,14 +114,14 @@ Web UI 是控制台式布局：左侧导航 + 顶栏状态，共八页——「�
 
 对话页工具条与会话抽屉支持：
 
-- 模型切换：四种基础模型（`glm-5.3` / `x-preview-l` (Flash) / `GLM-5-Turbo` / `glm-5.2`），以及各自的 `-forcehistory` 历史文件拆分版本；输入别名 `glm-5.3-flash`、`glm5.3flash`、`flash` 也会路由到 `x-preview-l`，`glm-5.1` 自动重映射到 `glm-5.2`
+- 模型切换：四种基础模型（`glm-5.3` / `x-preview-l` (Flash) / `GLM-5-Turbo` / `glm-5.5`），以及各自的 `-forcehistory` 历史文件拆分版本；输入别名 `glm-5.3-flash`、`glm5.3flash`、`flash` 也会路由到 `x-preview-l`，`glm-5.1` / `glm-5.2` 自动重映射到 `glm-5.5`
 - 联网搜索：对应 HAR 中的 `features.auto_web_search`
 - 深度思考：对应 HAR 中的 `features.enable_thinking`
-- 思考挡位：按模型区分——`glm-5.3` / `x-preview-l` 支持 `low` / `high` / `max` 三挡；`glm-5.2` 仅 `high` / `max`（收到 low 自动升为 high）；`GLM-5-Turbo` 只能开关思考、不发送挡位
+- 思考挡位：按模型区分——`glm-5.3` / `x-preview-l` / `glm-5.5` 支持 `low` / `high` / `max` 三挡（5.5 为新旗舰，暂按 5.3 同设）；`GLM-5-Turbo` 只能开关思考、不发送挡位
 - 显示 thinking 片段：默认不显示，可手动打开
 - 保持当前会话：成功发送后保存返回的 `chat_id`，后续请求可复用
 - 编辑上一条：把上一条用户消息放回输入框，发送时复用当前 `chat_id` 并生成新的 message id
-- 附件上传：支持一次选择多个文件、拖放或直接粘贴剪贴板图片/文件（自动去重），先上传到 `/api/v1/files/`，发送时按 HAR 的 `files` 字段带入 completion；首个文件确定账号后，其余文件由 3 个有界 worker 上传，不会因一次选择大量文件而无界并发。批次中途失败、发送失败或手动停止后，代理会尽力清理所有已成功上传的孤儿附件，避免在官方后台残留。附件**内容注入**由上游按模型决定：`glm-5.2` 实测正常；`x-preview-l`（Flash）上游不支持（官方前端同样看不到）；`glm-5.3` 视上游池而定，若回答“看不到附件”，可先用 `glm-5.2` 复测以区分链路问题与上游行为
+- 附件上传：支持一次选择多个文件、拖放或直接粘贴剪贴板图片/文件（自动去重），先上传到 `/api/v1/files/`，发送时按 HAR 的 `files` 字段带入 completion；首个文件确定账号后，其余文件由 3 个有界 worker 上传，不会因一次选择大量文件而无界并发。批次中途失败、发送失败或手动停止后，代理会尽力清理所有已成功上传的孤儿附件，避免在官方后台残留。附件**内容注入**由上游按模型决定：`x-preview-l`（Flash）上游不支持（官方前端同样看不到）；`glm-5.3` 视上游池而定；`glm-5.5` 待发布后实测（下架前的 `glm-5.2` 实测正常，可作参考基准）
 - 停止生成：首个回答片段出现后可停止当前上游任务；上游 stop 最多等待 10 秒，接受实测 `{}`、204 空正文、`{"status":true}` 以及任务已结束的 404。即使 stop 请求未获确认，只要已有 `chat_id` 就会先持久化登记删除，中断的上游 chat 不会因控制接口故障而跳过回收；已输出文本仍保留在本地会话和历史镜像中
 - 删除当前对话：完成或停止后可从上游删除当前 `chat_id`；删除不可恢复，下一次发送会创建新会话
 - 调用完成删除本对话：默认开启；成功响应后自动删除该次上游 chat，并自动关闭“保持当前会话”。关闭后才可复用 / 编辑当前 chat
@@ -343,7 +343,7 @@ python .\glm2api.py --serve --api-key "your-local-secret"
 python .\glm2api.py --har ..\zchat.z.ai.har --prompt "你好" --model glm-5.3 --fresh-captcha
 python .\glm2api.py --har ..\zchat.z.ai.har --prompt "你好" --model glm-5.3-flash --fresh-captcha
 python .\glm2api.py --har ..\zchat.z.ai.har --prompt "今天有什么新闻" --model glm-5.3 --web-search --fresh-captcha
-python .\glm2api.py --har ..\zchat.z.ai.har --prompt "只输出 OK" --model glm-5.2 --no-thinking --fresh-captcha
+python .\glm2api.py --har ..\zchat.z.ai.har --prompt "只输出 OK" --model glm-5.5 --no-thinking --fresh-captcha
 ```
 
 一键启动默认**不传** `--fresh-captcha`，而是按需使用账号已保存/手动验证码；只有显式传 `--fresh-captcha` 时才在每次 completion 前预求新码。`--fresh-captcha` 表示“每次请求获取新验证码”，不再把是否启用 fresh-captcha 与浏览器实现绑定。旧参数 `--fresh-captcha-browser` 仍作为隐藏兼容别名。验证码求解器由 `--captcha-mode auto|happydom|browser` 控制：`happydom` 仅使用本地 Node 解码器，不启动浏览器；`browser` 使用常驻复用的 Playwright headless Chrome；`auto` 优先 happy-dom，失败时才回落浏览器。当前 `zchat.z.ai` 的 PUZZLE 挑战无法无头自动完成，`browser` 路径会约 4 秒内返回 `puzzle challenge requires manual completion`；`--headed` 只用于观察窗口，拼图仍需人工拖动。
@@ -403,7 +403,7 @@ API 协议面**默认回传思维链**，不受面板"显示 Thinking"开关影�
 - 显式关闭：请求体传 `"include_thinking": false`（三种协议均支持）；模型为 `*-nothinking` 后缀或思考被关闭时思维链自然为空。
 - Anthropic 请求体 `thinking: {"type":"enabled","budget_tokens":N}` 会自动开启思考与回传。
 
-`GET /v1/models` 和网页模型下拉框只公布八项：`glm-5.3`、`x-preview-l`、`GLM-5-Turbo`、`glm-5.2` 及各自的 `-forcehistory` 变体。常见 OpenAI / Anthropic 模型名仍可作为**输入别名**接受：例如 `gpt-5`、`gpt-5-codex`、`gpt-4.1`、`claude-sonnet-4-6`、`claude-opus-4-6`、`claude-haiku-4-5`（默认路由到 `glm-5.3`）；`glm-5.3-flash` / `glm5.3flash` / `flash` 路由到 `x-preview-l`。响应中的 `model` 保留客户端请求的名称，方便 SDK 工作。
+`GET /v1/models` 和网页模型下拉框只公布八项：`glm-5.3`、`x-preview-l`、`GLM-5-Turbo`、`glm-5.5` 及各自的 `-forcehistory` 变体。常见 OpenAI / Anthropic 模型名仍可作为**输入别名**接受：例如 `gpt-5`、`gpt-5-codex`、`gpt-4.1`、`claude-sonnet-4-6`、`claude-opus-4-6`、`claude-haiku-4-5`（默认路由到 `glm-5.3`）；`glm-5.3-flash` / `glm5.3flash` / `flash` 路由到 `x-preview-l`。响应中的 `model` 保留客户端请求的名称，方便 SDK 工作。
 
 函数工具支持 OpenAI 的 `tools: [{type: "function", function: ...}]`、Responses 的 `tools: [{type: "function", name: ...}]` 与 Anthropic 的 `tools: [{name, input_schema, ...}]`；`inputSchema` 与 `schema` 也会归一化。适配器会把 JSON Schema、工具选择策略和完整对话一起封装，并将模型返回值转回原协议的 `tool_calls` / `function_call` / `tool_use` 结构。
 
@@ -433,7 +433,7 @@ Z.ai 单条 completion 最多携带 10 个附件。任一模型的生成分片�
 }
 ```
 
-模型名带 `-forcehistory` 时始终启用，例如 `glm-5.2-forcehistory` 或 `gpt-5-forcehistory`；普通模型在归一化上下文超过 `INLINE_CONTEXT_MAX_TOKENS`（默认 4000 token，或超过 `INLINE_CONTEXT_MAX_CHARS` = 16000 字符）时也会自动启用同一附件模式，显式传入 `context_as_file: false` 可关闭自动切换。带 `-nothinking` 时关闭上游深度思考，例如 `gpt-5-nothinking`。生成该文本附件的本地临时文件会在上传完成后立即删除。
+模型名带 `-forcehistory` 时始终启用，例如 `glm-5.5-forcehistory` 或 `gpt-5-forcehistory`；普通模型在归一化上下文超过 `INLINE_CONTEXT_MAX_TOKENS`（默认 4000 token，或超过 `INLINE_CONTEXT_MAX_CHARS` = 16000 字符）时也会自动启用同一附件模式，显式传入 `context_as_file: false` 可关闭自动切换。带 `-nothinking` 时关闭上游深度思考，例如 `gpt-5-nothinking`。生成该文本附件的本地临时文件会在上传完成后立即删除。
 
 ## 调用完成自动删除
 

@@ -204,7 +204,7 @@ class RealtimeStreamCases:
         app.stream_zai_completion = fake_stream
         try:
             body = {
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "messages": [{"role": "user", "content": "weather"}],
                 "tools": TOOLS,
                 "tool_choice": "auto",
@@ -249,7 +249,7 @@ class RealtimeStreamCases:
         app.stream_zai_completion = fake_stream
         try:
             body = {
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "input": "weather",
                 "tools": [
                     {
@@ -313,7 +313,7 @@ class RealtimeStreamCases:
         app.stream_zai_completion = fake_stream
         try:
             body = {
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "input": "weather",
                 "tools": [
                     {

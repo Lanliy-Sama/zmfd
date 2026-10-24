@@ -289,7 +289,7 @@ class ProtocolAdaptersTestSupport:
     ) -> str:
         record_id = app.start_history_record(
             surface=surface,
-            model="glm-5.2",
+            model="glm-5.5",
             stream=True,
             user_input=user,
             messages=[{"role": "user", "content": user}],

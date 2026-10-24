@@ -140,7 +140,7 @@ class WebAndCompatibilityCases:
 
     def test_context_upload_degrade_falls_back_to_mode_a(self) -> None:
         body = {
-            "model": "glm-5.2-forcehistory",
+            "model": "glm-5.5-forcehistory",
             "messages": [{"role": "user", "content": "历史拆分降级测试"}],
             "tools": [{
                 "type": "function",
@@ -329,7 +329,7 @@ class WebAndCompatibilityCases:
     def test_context_upload_partial_failure_does_not_send_half_package(self) -> None:
         request = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2-forcehistory",
+                "model": "glm-5.5-forcehistory",
                 "messages": [{"role": "user", "content": "检查原子降级"}],
                 "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
             },
@@ -368,7 +368,7 @@ class WebAndCompatibilityCases:
     def test_context_upload_failure_does_not_delete_shared_cached_part(self) -> None:
         request = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2-forcehistory",
+                "model": "glm-5.5-forcehistory",
                 "messages": [{"role": "user", "content": "cached ownership"}],
                 "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
             },
@@ -407,11 +407,11 @@ class WebAndCompatibilityCases:
         self.assertTrue(prompt.endswith(request.context_text))
 
     def test_per_model_reasoning_effort(self) -> None:
-        # 2026-08 官方 UI：glm-5.3 / Flash 三挡（max/high/low），glm-5.2 两挡，
+        # 2026-08 官方 UI：glm-5.3 / Flash 三挡（max/high/low）；glm-5.5 为新旗舰，暂按三挡处理，
         # GLM-5-Turbo 仅思考开关（completions features 不携带 reasoning_effort）。
         self.assertEqual("low", app.coerce_reasoning_effort_for_model("glm-5.3", "low"))
         self.assertEqual("low", app.coerce_reasoning_effort_for_model("x-preview-l", "low"))
-        self.assertEqual("high", app.coerce_reasoning_effort_for_model("glm-5.2", "low"))
+        self.assertEqual("low", app.coerce_reasoning_effort_for_model("glm-5.5", "low"))
         self.assertEqual("max", app.coerce_reasoning_effort_for_model("GLM-5-Turbo", "max"))
 
         state = fake_state()
@@ -1236,11 +1236,11 @@ class WebAndCompatibilityCases:
         self.assertNotIn("</tool_call>", transcript)
 
         # Claude Code appends context-window hints like [1M] to model IDs.
-        self.assertEqual("glm-5.2", app.normalize_model("glm-5.2[1M]"))
-        self.assertEqual("glm-5.2", app.normalize_model("glm-5.2-forcehistory[1M]"))
-        self.assertEqual("glm-5.2", app.normalize_model("GLM-5.2-forcehistory[200k]"))
-        self.assertTrue(app.is_force_history_model("glm-5.2-forcehistory[1M]"))
-        self.assertTrue(app.is_no_thinking_model("glm-5.2[1m]-nothinking"))
+        self.assertEqual("glm-5.5", app.normalize_model("glm-5.5[1M]"))
+        self.assertEqual("glm-5.5", app.normalize_model("glm-5.5-forcehistory[1M]"))
+        self.assertEqual("glm-5.5", app.normalize_model("GLM-5.2-forcehistory[200k]"))
+        self.assertTrue(app.is_force_history_model("glm-5.5-forcehistory[1M]"))
+        self.assertTrue(app.is_no_thinking_model("glm-5.5[1m]-nothinking"))
 
     def test_fresh_captcha_falls_back_to_stored(self) -> None:
         state = fake_state()
@@ -1260,17 +1260,17 @@ class WebAndCompatibilityCases:
             app._CAPTCHA_MODE = "browser"  # 本测试只考察浏览器 worker 路径
             app.CAPTCHA_RETRY_BACKOFF_SECONDS = 0
             app._set_captcha_degraded(-3600)  # 清除冷却
-            result = app.resolve_fresh_captcha(state, "glm-5.2", BrokenWorker(), timeout_ms=1000)
+            result = app.resolve_fresh_captcha(state, "glm-5.5", BrokenWorker(), timeout_ms=1000)
             self.assertEqual("stored-captcha-280", result)
             # 冷却期内直接复用存储验证码，不再触发慢速浏览器流程。
-            result = app.resolve_fresh_captcha(state, "glm-5.2", ExplodingWorker(), timeout_ms=1000)
+            result = app.resolve_fresh_captcha(state, "glm-5.5", ExplodingWorker(), timeout_ms=1000)
             self.assertEqual("stored-captcha-280", result)
             # 无存储验证码且 solver 失败 -> 同时提示检查本地求解器和登录态。
             empty = fake_state()
             empty.captcha_verify_param = ""
             app._set_captcha_degraded(-3600)
             with self.assertRaisesRegex(RuntimeError, "确认本地求解器可用"):
-                app.resolve_fresh_captcha(empty, "glm-5.2", BrokenWorker(), timeout_ms=1000)
+                app.resolve_fresh_captcha(empty, "glm-5.5", BrokenWorker(), timeout_ms=1000)
         finally:
             app._CAPTCHA_MODE = original_mode
             app.CAPTCHA_RETRY_BACKOFF_SECONDS = original_backoff
@@ -1288,7 +1288,7 @@ class WebAndCompatibilityCases:
         try:
             app._CAPTCHA_MODE = "browser"
             app._set_captcha_degraded(-3600)
-            self.assertEqual("fresh-captcha", app.resolve_fresh_captcha(state, "glm-5.2", GoodWorker(), timeout_ms=1000))
+            self.assertEqual("fresh-captcha", app.resolve_fresh_captcha(state, "glm-5.5", GoodWorker(), timeout_ms=1000))
         finally:
             app._CAPTCHA_MODE = original_mode
             app._set_captcha_degraded(-3600)
@@ -1316,14 +1316,14 @@ class WebAndCompatibilityCases:
             app._set_captcha_degraded(1800)  # 无存储验证码时冷却必须自愈，不能裸发
             app.get_happydom_captcha = lambda *_a, **_k: "hd-captcha"
             self.assertEqual(
-                "hd-captcha", app.resolve_fresh_captcha(state, "glm-5.2", NeverWorker(), timeout_ms=1000)
+                "hd-captcha", app.resolve_fresh_captcha(state, "glm-5.5", NeverWorker(), timeout_ms=1000)
             )
             # happydom 返回空 -> 回落到浏览器 worker（先清验证码池，避开预解残留）。
             app._CAPTCHA_POOL.clear()
             app._set_captcha_degraded(-3600)
             app.get_happydom_captcha = lambda *_a, **_k: ""
             self.assertEqual(
-                "fresh-captcha", app.resolve_fresh_captcha(state, "glm-5.2", GoodWorker(), timeout_ms=1000)
+                "fresh-captcha", app.resolve_fresh_captcha(state, "glm-5.5", GoodWorker(), timeout_ms=1000)
             )
         finally:
             app._CAPTCHA_MODE = original_mode
@@ -1457,7 +1457,7 @@ class WebAndCompatibilityCases:
             app._captcha_playwright = lambda: BrokenPlaywrightFactory()
             started = time.monotonic()
             with self.assertRaisesRegex(RuntimeError, "playwright startup failed"):
-                worker.solve(fake_state(), "glm-5.2", timeout_ms=10_000)
+                worker.solve(fake_state(), "glm-5.5", timeout_ms=10_000)
             self.assertLess(time.monotonic() - started, 2.0)
             status = worker.status()
             self.assertFalse(status["thread_alive"])
@@ -1472,14 +1472,14 @@ class WebAndCompatibilityCases:
         parked = app._CaptchaWorkItem(
             request_id="parked",
             state=fake_state(),
-            selected_model="glm-5.2",
+            selected_model="glm-5.5",
             timeout_ms=10_000,
             deadline=time.monotonic() + 10,
         )
         worker._requests.put_nowait(parked)
         try:
             with self.assertRaisesRegex(RuntimeError, "backlog is full"):
-                worker.solve(fake_state(), "glm-5.2", timeout_ms=10_000)
+                worker.solve(fake_state(), "glm-5.5", timeout_ms=10_000)
             status = worker.status()
             self.assertEqual(1, status["pending"])
             self.assertEqual(1, status["max_pending"])
@@ -1502,7 +1502,7 @@ class WebAndCompatibilityCases:
             with self.assertRaises(app.ServiceShuttingDown):
                 worker.solve(
                     fake_state(),
-                    "glm-5.2",
+                    "glm-5.5",
                     timeout_ms=10_000,
                     cancel_check=cancel_check,
                 )
@@ -1588,11 +1588,11 @@ class WebAndCompatibilityCases:
             worker = app.CaptchaWorker(idle_timeout_sec=0)
             try:
                 # 首次：页面失败后自动重建并重试成功
-                self.assertEqual("captcha-value", worker.solve(fake_state(), "glm-5.2"))
+                self.assertEqual("captcha-value", worker.solve(fake_state(), "glm-5.5"))
                 self.assertEqual(2, calls["n"])
                 self.assertEqual(2, len(factory.chromium.browsers))
                 # 第二次：相同 token/device 复用页面，不再 launch
-                self.assertEqual("captcha-value", worker.solve(fake_state(), "glm-5.2"))
+                self.assertEqual("captcha-value", worker.solve(fake_state(), "glm-5.5"))
                 self.assertEqual(3, calls["n"])
                 self.assertEqual(2, len(factory.chromium.browsers))
             finally:
@@ -1672,7 +1672,7 @@ class WebAndCompatibilityCases:
             worker = app.CaptchaWorker(idle_timeout_sec=0)
             try:
                 with self.assertRaises(RuntimeError):
-                    worker.solve(fake_state(), "glm-5.2")
+                    worker.solve(fake_state(), "glm-5.5")
             finally:
                 worker.close()
             self.assertEqual(2, calls["n"])
@@ -1697,7 +1697,7 @@ class WebAndCompatibilityCases:
                 "POST",
                 "/v1/chat/completions",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": "你好"}],
                     "stream": False,
                 },
@@ -1722,7 +1722,7 @@ class WebAndCompatibilityCases:
                 "POST",
                 "/v1/chat/completions",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": "你好"}],
                     "stream": False,
                 },
@@ -1745,7 +1745,7 @@ class WebAndCompatibilityCases:
         tools = [{"name": "get_weather", "parameters": {"type": "object"}}]
         request = app.ProtocolRequest(
             surface="openai_chat",
-            response_model="glm-5.2",
+            response_model="glm-5.5",
             options=app.ChatOptions(),
             stream=False,
             messages=[],
@@ -1780,7 +1780,7 @@ class WebAndCompatibilityCases:
             "POST",
             "/v1/chat/completions",
             {
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "stream": False,
                 "messages": [
                     {"role": "user", "content": "北京天气"},

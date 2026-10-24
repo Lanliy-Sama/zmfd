@@ -124,7 +124,7 @@ class ToolAndContextCases:
     def test_finalize_rejects_malformed_tool_markup_for_bounded_retry(self) -> None:
         request = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "messages": [{"role": "user", "content": "hi"}],
                 "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
             },
@@ -249,7 +249,7 @@ class ToolAndContextCases:
     def test_finalize_ignores_tool_markup_inside_inline_code(self) -> None:
         request = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "messages": [{"role": "user", "content": "hi"}],
                 "tools": [{"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}],
             },
@@ -408,7 +408,7 @@ class ToolAndContextCases:
             }
         ]
         request = app.normalize_openai_chat_request(
-            {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "tools": tools},
+            {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}], "tools": tools},
             False,
         )
         turn = app.finalize_protocol_turn(request, markup, "")
@@ -432,7 +432,7 @@ class ToolAndContextCases:
         markup = '<|DSML|tool_calls><|DSML|invoke name="get_weather"><|DSML|parameter name="city"><![CDATA[上海]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>'
 
         required = app.normalize_openai_chat_request(
-            {"model": "glm-5.2", "messages": [{"role": "user", "content": "天气？"}], "tools": tools, "tool_choice": "required"},
+            {"model": "glm-5.5", "messages": [{"role": "user", "content": "天气？"}], "tools": tools, "tool_choice": "required"},
             False,
         )
         turn = app.finalize_protocol_turn(required, "我来查一下。", markup)
@@ -442,7 +442,7 @@ class ToolAndContextCases:
         self.assertEqual("", turn.thinking)
 
         auto = app.normalize_openai_chat_request(
-            {"model": "glm-5.2", "messages": [{"role": "user", "content": "天气？"}], "tools": tools},
+            {"model": "glm-5.5", "messages": [{"role": "user", "content": "天气？"}], "tools": tools},
             False,
         )
         # Auto mode follows the model's visible final-channel decision. Hidden
@@ -654,17 +654,17 @@ class ToolAndContextCases:
         for surface, prefix, expected_len in expectations:
             if surface == "openai_chat":
                 request = app.normalize_openai_chat_request(
-                    {"model": "glm-5.2", "messages": [{"role": "user", "content": "天气？"}], "tools": tools, "tool_choice": "required"},
+                    {"model": "glm-5.5", "messages": [{"role": "user", "content": "天气？"}], "tools": tools, "tool_choice": "required"},
                     False,
                 )
             elif surface == "openai_responses":
                 request = app.normalize_openai_responses_request(
-                    {"model": "glm-5.2", "input": "天气？", "tools": tools, "tool_choice": "required"},
+                    {"model": "glm-5.5", "input": "天气？", "tools": tools, "tool_choice": "required"},
                     False,
                 )
             else:
                 request = app.normalize_anthropic_messages_request(
-                    {"model": "glm-5.2", "messages": [{"role": "user", "content": "天气？"}], "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}], "tool_choice": {"type": "any"}},
+                    {"model": "glm-5.5", "messages": [{"role": "user", "content": "天气？"}], "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}], "tool_choice": {"type": "any"}},
                     False,
                 )
             turn = app.finalize_protocol_turn(request, markup, "")
@@ -676,14 +676,14 @@ class ToolAndContextCases:
 
     def test_responses_object_embeds_thinking_summary(self) -> None:
         request = app.normalize_openai_responses_request(
-            {"model": "glm-5.2", "input": "hello", "include_thinking": True},
+            {"model": "glm-5.5", "input": "hello", "include_thinking": True},
             True,
         )
         turn = app.finalize_protocol_turn(request, "正文", "思考内容")
         payload = app.build_openai_response_object("resp_test", request, turn, status="completed")
         self.assertEqual([{"type": "summary_text", "text": "思考内容"}], payload["reasoning"]["summary"])
         self.assertEqual("正文", payload["output_text"])
-        hidden_request = app.normalize_openai_responses_request({"model": "glm-5.2", "input": "hello"}, False)
+        hidden_request = app.normalize_openai_responses_request({"model": "glm-5.5", "input": "hello"}, False)
         hidden = app.build_openai_response_object(
             "resp_test3", hidden_request, app.finalize_protocol_turn(hidden_request, "正文", "思考内容"), status="completed"
         )
@@ -691,7 +691,7 @@ class ToolAndContextCases:
 
     def test_responses_output_embeds_reasoning_item(self) -> None:
         request = app.normalize_openai_responses_request(
-            {"model": "glm-5.2", "input": "hello", "include_thinking": True},
+            {"model": "glm-5.5", "input": "hello", "include_thinking": True},
             True,
         )
         turn = app.finalize_protocol_turn(request, "正文", "思考内容")
@@ -703,7 +703,7 @@ class ToolAndContextCases:
 
         hidden = app.build_openai_response_object(
             "resp_reason2",
-            app.normalize_openai_responses_request({"model": "glm-5.2", "input": "hello"}, False),
+            app.normalize_openai_responses_request({"model": "glm-5.5", "input": "hello"}, False),
             app.finalize_protocol_turn(request, "正文", "思考内容"),
             status="completed",
         )
@@ -1258,12 +1258,12 @@ class ToolAndContextCases:
         self.assertTrue(request.tool_choice.disable_parallel)
 
         regular_request = app.normalize_openai_responses_request(
-            {"model": "glm-5.2", "input": "不应自动走历史文件"},
+            {"model": "glm-5.5", "input": "不应自动走历史文件"},
             False,
         )
         self.assertFalse(regular_request.context_as_file)
-        self.assertEqual("glm-5.2", regular_request.options.model)
-        self.assertEqual("glm-5.2", app.normalize_model("GLM-5.1-forcehistory"))
+        self.assertEqual("glm-5.5", regular_request.options.model)
+        self.assertEqual("glm-5.5", app.normalize_model("GLM-5.1-forcehistory"))
         no_thinking_response = app.normalize_openai_responses_request(
             {"model": "gpt-5-nothinking", "input": "x", "reasoning": {"effort": "high"}},
             True,
@@ -1274,11 +1274,11 @@ class ToolAndContextCases:
                 "glm-5.3",
                 "x-preview-l",
                 "GLM-5-Turbo",
-                "glm-5.2",
+                "glm-5.5",
                 "glm-5.3-forcehistory",
                 "x-preview-l-forcehistory",
                 "GLM-5-Turbo-forcehistory",
-                "glm-5.2-forcehistory",
+                "glm-5.5-forcehistory",
             ],
             list(app.ADVERTISED_MODELS),
         )
@@ -1293,7 +1293,7 @@ class ToolAndContextCases:
         requests = [
             app.normalize_openai_chat_request(
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": "echo"}],
                     "tools": openai_tools,
                     "parallel_tool_calls": False,
@@ -1302,7 +1302,7 @@ class ToolAndContextCases:
             ),
             app.normalize_openai_responses_request(
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "input": "echo",
                     "tools": [{"type": "function", "name": "echo", "parameters": {"type": "object"}}],
                     "parallel_tool_calls": False,
@@ -1311,7 +1311,7 @@ class ToolAndContextCases:
             ),
             app.normalize_anthropic_messages_request(
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": "echo"}],
                     "tools": anthropic_tools,
                     "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
@@ -1332,7 +1332,7 @@ class ToolAndContextCases:
 
         parallel = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "messages": [{"role": "user", "content": "echo"}],
                 "tools": openai_tools,
                 "parallel_tool_calls": True,
@@ -1384,7 +1384,7 @@ class ToolAndContextCases:
 
     def test_allowed_tools_filters_prompt_and_parser(self) -> None:
         body = {
-            "model": "glm-5.2",
+            "model": "glm-5.5",
             "input": "读取文件",
             "tools": [
                 {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
@@ -1429,7 +1429,7 @@ class ToolAndContextCases:
         # （Output integrity guard + 执行指令）；镜像 history_text 记实际附件内容。
         request = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2-forcehistory",
+                "model": "glm-5.5-forcehistory",
                 "messages": [
                     {"role": "system", "content": "你是助手"},
                     {"role": "user", "content": "北京天气"},
@@ -1496,7 +1496,7 @@ class ToolAndContextCases:
     def test_file_mode_tool_choice_none_matches_reference_attachment_policy(self) -> None:
         request = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2-forcehistory",
+                "model": "glm-5.5-forcehistory",
                 "messages": [
                     {"role": "user", "content": "先查天气"},
                     {"role": "tool", "tool_call_id": "old_call", "name": "get_weather", "content": "晴"},
@@ -1697,7 +1697,7 @@ class ToolAndContextCases:
             "POST",
             "/v1/chat/completions",
             {
-                "model": "glm-5.2-forcehistory",
+                "model": "glm-5.5-forcehistory",
                 "messages": [{"role": "user", "content": "history plus too many user files"}],
                 "files": user_files[:11],
                 "stream": False,
@@ -2144,7 +2144,7 @@ class ToolAndContextCases:
     def test_large_inline_context_auto_switches_to_transcript_files(self) -> None:
         long_message = "token " * (app.INLINE_CONTEXT_MAX_TOKENS + 100)
         automatic = app.normalize_openai_chat_request(
-            {"model": "glm-5.2", "messages": [{"role": "user", "content": long_message}]},
+            {"model": "glm-5.5", "messages": [{"role": "user", "content": long_message}]},
             False,
         )
         self.assertTrue(automatic.context_as_file)
@@ -2152,7 +2152,7 @@ class ToolAndContextCases:
 
         explicit_inline = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "messages": [{"role": "user", "content": long_message}],
                 "context_as_file": False,
             },
@@ -2161,13 +2161,13 @@ class ToolAndContextCases:
         self.assertFalse(explicit_inline.context_as_file, "显式关闭应保留用户选择")
 
         small = app.normalize_openai_chat_request(
-            {"model": "glm-5.2", "messages": [{"role": "user", "content": "你好"}]},
+            {"model": "glm-5.5", "messages": [{"role": "user", "content": "你好"}]},
             False,
         )
         self.assertFalse(small.context_as_file)
 
         token_heavy = app.normalize_openai_chat_request(
-            {"model": "glm-5.2", "messages": [{"role": "user", "content": "上下文" * 3000}]},
+            {"model": "glm-5.5", "messages": [{"role": "user", "content": "上下文" * 3000}]},
             False,
         )
         self.assertTrue(token_heavy.context_as_file, "tokens 超过阈值但字符数未超过时也应切换")
@@ -2188,7 +2188,7 @@ class ToolAndContextCases:
                 "POST",
                 "/v1/chat/completions",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": filler}],
                     "stream": False,
                 },
@@ -2206,12 +2206,12 @@ class ToolAndContextCases:
     def test_generated_context_parts_are_50_kib_for_every_model(self) -> None:
         self.assertEqual(50 * 1024, app.CONTEXT_FILE_PART_BYTES)
         self.assertEqual(app.CONTEXT_FILE_PART_BYTES, app.GLM53_CONTEXT_FILE_PART_BYTES)
-        for model in ("glm-5.3", "glm-5.2", "x-preview-l", "GLM-5-Turbo"):
+        for model in ("glm-5.3", "glm-5.5", "x-preview-l", "GLM-5-Turbo"):
             self.assertEqual(app.CONTEXT_FILE_PART_BYTES, app.generated_context_file_part_limit(model))
         parts = app.split_generated_context_text(
             "x" * (app.CONTEXT_FILE_PART_BYTES * 3),
             "history",
-            "glm-5.2",
+            "glm-5.5",
         )
         self.assertGreater(len(parts), 3)
         self.assertTrue(all(len(part.encode("utf-8")) <= app.CONTEXT_FILE_PART_BYTES for part in parts))
@@ -2219,7 +2219,7 @@ class ToolAndContextCases:
     def test_protocol_json_body_accepts_context_above_the_old_2mib_limit(self) -> None:
         filler = "token " * 420_000
         payload = {
-            "model": "glm-5.2",
+            "model": "glm-5.5",
             "messages": [{"role": "user", "content": filler}],
             "context_as_file": False,
             "stream": False,
@@ -2234,7 +2234,7 @@ class ToolAndContextCases:
     def test_all_models_split_generated_context_at_50kib(self) -> None:
         request = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2-forcehistory",
+                "model": "glm-5.5-forcehistory",
                 "messages": [{"role": "user", "content": "H" * 70000}],
                 "tools": [
                     {
@@ -2271,7 +2271,7 @@ class ToolAndContextCases:
     def test_output_integrity_guard_scope(self) -> None:
         # 无工具且无 tool 历史：不加守卫（避免多余指纹）；有工具：守卫前置且不重复
         plain = app.normalize_openai_chat_request(
-            {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}]},
+            {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}]},
             False,
         )
         prompt, _files = app.prepare_protocol_upstream_request(fake_state(), plain)
@@ -2280,7 +2280,7 @@ class ToolAndContextCases:
 
         tool_req = app.normalize_openai_chat_request(
             {
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "messages": [{"role": "user", "content": "天气"}],
                 "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
             },
@@ -2439,7 +2439,7 @@ class ToolAndContextCases:
                 "status": "error",
                 "surface": "anthropic_messages",
                 "caller": "api",
-                "model": "glm-5.2",
+                "model": "glm-5.5",
                 "created_at": now_ms - 30_000,
                 "elapsed_ms": 2400,
                 "status_code": 503,
@@ -2693,19 +2693,19 @@ class ToolAndContextCases:
             requests = [
                 (
                     "/v1/chat/completions",
-                    {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                    {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}], "stream": True},
                 ),
-                ("/v1/responses", {"model": "glm-5.2", "input": "hi", "stream": True}),
+                ("/v1/responses", {"model": "glm-5.5", "input": "hi", "stream": True}),
                 (
                     "/v1/messages",
                     {
-                        "model": "glm-5.2",
+                        "model": "glm-5.5",
                         "max_tokens": 32,
                         "messages": [{"role": "user", "content": "hi"}],
                         "stream": True,
                     },
                 ),
-                ("/api/chat", {"model": "glm-5.2", "message": "hi", "stream": True}),
+                ("/api/chat", {"model": "glm-5.5", "message": "hi", "stream": True}),
             ]
             results = [self.request("POST", path, body) for path, body in requests]
         finally:
@@ -2772,7 +2772,7 @@ class ToolAndContextCases:
             status, raw = self.request(
                 "POST",
                 "/v1/chat/completions",
-                {"model": "glm-5.2", "messages": [{"role": "user", "content": "show example"}]},
+                {"model": "glm-5.5", "messages": [{"role": "user", "content": "show example"}]},
             )
         finally:
             app.stream_zai_completion = original_stream

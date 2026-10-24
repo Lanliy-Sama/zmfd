@@ -50,7 +50,7 @@ class HistoryAndCleanupCases:
             status, raw = self.request(
                 "POST",
                 "/api/settings",
-                {"model": "glm-5.2"},
+                {"model": "glm-5.5"},
                 headers=hostile,
             )
             self.assertEqual(403, status)
@@ -472,7 +472,7 @@ class HistoryAndCleanupCases:
     def test_history_progress_persists_midstream(self) -> None:
         rid = app.start_history_record(
             surface="panel_chat",
-            model="glm-5.2",
+            model="glm-5.5",
             stream=True,
             user_input="进度问",
             messages=[{"role": "user", "content": "进度问"}],
@@ -506,7 +506,7 @@ class HistoryAndCleanupCases:
     def test_history_persist_retries_when_index_write_fails(self) -> None:
         rid = app.start_history_record(
             surface="panel_chat",
-            model="glm-5.2",
+            model="glm-5.5",
             stream=True,
             user_input="索引失败重试",
             messages=[{"role": "user", "content": "索引失败重试"}],
@@ -656,7 +656,7 @@ class HistoryAndCleanupCases:
     def test_history_record_preserves_upstream_delivery_manifest(self) -> None:
         rid = app.start_history_record(
             surface="openai_chat",
-            model="glm-5.2",
+            model="glm-5.5",
             stream=True,
             user_input="最后一问",
             messages=[{"role": "user", "content": "最后一问"}],
@@ -896,7 +896,7 @@ class HistoryAndCleanupCases:
                 self.original_stream(
                     state,
                     "镜像是哪来的",
-                    options=app.ChatOptions(model="glm-5.2"),
+                    options=app.ChatOptions(model="glm-5.5"),
                     retry_wait_sec=0,
                     history_ctx={
                         "surface": "openai_chat",
@@ -964,7 +964,7 @@ class HistoryAndCleanupCases:
                 "POST",
                 "/v1/chat/completions",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": "输出预算"}],
                     "stream": False,
                 },
@@ -1008,13 +1008,13 @@ class HistoryAndCleanupCases:
         cases = [
             (
                 "/v1/chat/completions",
-                {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}], "stream": True},
             ),
-            ("/v1/responses", {"model": "glm-5.2", "input": "hi", "stream": True}),
+            ("/v1/responses", {"model": "glm-5.5", "input": "hi", "stream": True}),
             (
                 "/v1/messages",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "max_tokens": 32,
                     "messages": [{"role": "user", "content": "hi"}],
                     "stream": True,
@@ -1100,7 +1100,7 @@ class HistoryAndCleanupCases:
             gen = self.original_stream(
                 state,
                 "只读到一半就断开",
-                options=app.ChatOptions(model="glm-5.2"),
+                options=app.ChatOptions(model="glm-5.5"),
                 retry_wait_sec=0,
                 history_ctx={
                     "surface": "openai_chat",
@@ -1141,7 +1141,7 @@ class HistoryAndCleanupCases:
                     self.original_stream(
                         state,
                         "会失败的请求",
-                        options=app.ChatOptions(model="glm-5.2"),
+                        options=app.ChatOptions(model="glm-5.5"),
                         retry_attempts=1,
                         history_ctx={
                             "surface": "openai_chat",
@@ -1166,7 +1166,7 @@ class HistoryAndCleanupCases:
             "records": [
                 {
                     "chat_id": "00000000-0000-0000-0000-00000000d001",
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "timestamp": 1787938848,
                     "title": "旧问",
                     "prompt": "旧问",
@@ -1241,13 +1241,13 @@ class HistoryAndCleanupCases:
             with self.assertRaises(RuntimeError):
                 list(
                     self.original_stream(
-                        state, "降级重试", options=app.ChatOptions(model="glm-5.2"), retry_attempts=1, history_ctx=history_ctx
+                        state, "降级重试", options=app.ChatOptions(model="glm-5.5"), retry_attempts=1, history_ctx=history_ctx
                     )
                 )
             # 第二次：同 ctx 复用记录并成功
             list(
                 self.original_stream(
-                    state, "降级重试", options=app.ChatOptions(model="glm-5.2"), retry_attempts=1, history_ctx=history_ctx
+                    state, "降级重试", options=app.ChatOptions(model="glm-5.5"), retry_attempts=1, history_ctx=history_ctx
                 )
             )
         finally:
@@ -1305,7 +1305,7 @@ class HistoryAndCleanupCases:
                 self.original_stream(
                     state,
                     "hi",
-                    options=app.ChatOptions(model="glm-5.2"),
+                    options=app.ChatOptions(model="glm-5.5"),
                     retry_wait_sec=0,
                     retry_attempts=3,
                 )

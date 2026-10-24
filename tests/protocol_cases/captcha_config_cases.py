@@ -146,7 +146,7 @@ class CaptchaConfigCases:
                 side_effect=app.CaptchaPuzzleRequired("puzzle challenge requires manual completion (F001)"),
             ) as solver:
                 with self.assertRaisesRegex(RuntimeError, "手动验证码"):
-                    app.resolve_fresh_captcha(state, "glm-5.2", None, 5_000)
+                    app.resolve_fresh_captcha(state, "glm-5.5", None, 5_000)
             self.assertEqual(1, solver.call_count)
         finally:
             app._CAPTCHA_MODE = previous_mode
@@ -199,7 +199,7 @@ class CaptchaConfigCases:
                 "get_browser_captcha",
                 side_effect=AssertionError("browser solver must not run"),
             ):
-                value = app.resolve_fresh_captcha(state, "glm-5.2", None, 5_000)
+                value = app.resolve_fresh_captcha(state, "glm-5.5", None, 5_000)
         finally:
             app._CAPTCHA_MODE = previous_mode
             with app._MANUAL_CAPTCHA_LOCK:
@@ -241,7 +241,7 @@ class CaptchaConfigCases:
                 create_chat=True,
                 captcha_verify_param=None,
                 fresh_captcha_browser=False,
-                options=app.ChatOptions(model="glm-5.2"),
+                options=app.ChatOptions(model="glm-5.5"),
             )
             for _event in events:
                 pass

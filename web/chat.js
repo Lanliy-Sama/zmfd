@@ -17,11 +17,11 @@
       btnDeleteUpstream.disabled = !state.currentChatId || Boolean(state.activeRequest);
     }
 
-    // 各模型思考挡位（2026-08 官方 UI）：glm-5.3 / Flash 三挡，glm-5.2 两挡，
+    // 各模型思考挡位：glm-5.3 / Flash / glm-5.5 三挡（5.5 为新旗舰，暂按 5.3 同设），
     // GLM-5-Turbo 只能开关思考、无挡位。
     function effortOptionsForModel(modelId) {
       const m = (modelId || "").toLowerCase();
-      if (m === "x-preview-l" || m.startsWith("glm-5.3")) {
+      if (m === "x-preview-l" || m.startsWith("glm-5.3") || m.startsWith("glm-5.5")) {
         return [["max", "max"], ["high", "high"], ["low", "low"]];
       }
       if (m === "glm-5-turbo") {
@@ -51,7 +51,7 @@
 
     function syncOptionStates() {
       syncEffortOptions();
-      const isEffortModel = /^(glm-5\.2|glm-5\.3)/.test(modelSelect.value.toLowerCase());
+      const isEffortModel = /^(glm-5\.3|glm-5\.5)/.test(modelSelect.value.toLowerCase());
       reasoningEffortSelect.disabled = !thinkingToggle.checked || !isEffortModel;
       reasoningEffortGroup.style.opacity = reasoningEffortSelect.disabled ? "0.45" : "1";
 

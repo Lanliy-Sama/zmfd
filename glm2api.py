@@ -552,7 +552,7 @@ FLASH_MODEL = "x-preview-l"
 # site picker (2026-08 official list: GLM-5.3-Flash / GLM-5.3 / GLM-5.2 / GLM-5-Turbo).
 # Upstream IDs are case-sensitive here: "GLM-5-Turbo" works, "glm-5-turbo" 500s.
 TURBO_MODEL = "GLM-5-Turbo"
-SUPPORTED_MODELS = ("glm-5.3", "x-preview-l", "GLM-5-Turbo", "glm-5.2")
+SUPPORTED_MODELS = ("glm-5.3", "x-preview-l", "GLM-5-Turbo", "glm-5.5")
 # Only these IDs are advertised to local model discovery/UI clients.  The
 # suffix is a local routing hint and is removed before the request reaches Z.ai.
 FORCE_HISTORY_MODEL_SUFFIX = "-forcehistory"
@@ -561,11 +561,11 @@ ADVERTISED_MODELS = (
     "glm-5.3",
     "x-preview-l",
     "GLM-5-Turbo",
-    "glm-5.2",
+    "glm-5.5",
     "glm-5.3-forcehistory",
     "x-preview-l-forcehistory",
     "GLM-5-Turbo-forcehistory",
-    "glm-5.2-forcehistory",
+    "glm-5.5-forcehistory",
 )
 MODEL = DEFAULT_MODEL
 FE_VERSION = "prod-fe-1.1.107"
@@ -2834,13 +2834,17 @@ def normalize_model(value: Any = _MISSING) -> str:
         "glm5.3flash": FLASH_MODEL,
         "glm-5.3-flash": FLASH_MODEL,
         "x-preview-l": FLASH_MODEL,
-        "5.2": "glm-5.2",
-        "glm5.2": "glm-5.2",
-        "glm-5.2": "glm-5.2",
-        # GLM-5.1 已从官网下架（上游现已 500），旧 ID 重映射到继任旗舰 glm-5.2。
-        "5.1": "glm-5.2",
-        "glm5.1": "glm-5.2",
-        "glm-5.1": "glm-5.2",
+        "5.5": "glm-5.5",
+        "glm5.5": "glm-5.5",
+        "glm-5.5": "glm-5.5",
+        # GLM-5.1 已从官网下架（上游现已 500）；GLM-5.2 将随 GLM-5.5 发布退场。
+        # 旧 ID（5.1 / 5.2 系）统一重映射到阵容接替者 glm-5.5。
+        "5.2": "glm-5.5",
+        "glm5.2": "glm-5.5",
+        "glm-5.2": "glm-5.5",
+        "5.1": "glm-5.5",
+        "glm5.1": "glm-5.5",
+        "glm-5.1": "glm-5.5",
         "glm-5-turbo": TURBO_MODEL,
         "glm5turbo": TURBO_MODEL,
         "5-turbo": TURBO_MODEL,
@@ -2856,20 +2860,20 @@ def normalize_model(value: Any = _MISSING) -> str:
         "gpt-5.2-codex": "glm-5.3",
         "gpt-5.3-codex": "glm-5.3",
         "gpt-4.1": "glm-5.3",
-        "gpt-4o": "glm-5.2",
+        "gpt-4o": "glm-5.5",
         "o1": "glm-5.3",
         "o3": "glm-5.3",
-        "o4-mini": "glm-5.2",
+        "o4-mini": "glm-5.5",
         "claude-sonnet-4-6": "glm-5.3",
         "claude-opus-4-6": "glm-5.3",
-        "claude-haiku-4-5": "glm-5.2",
+        "claude-haiku-4-5": "glm-5.5",
         "claude-3-5-sonnet-latest": "glm-5.3",
-        "claude-3-5-haiku-latest": "glm-5.2",
+        "claude-3-5-haiku-latest": "glm-5.5",
     }
     if lower in aliases:
         return aliases[lower]
     if lower.startswith("claude-"):
-        return "glm-5.2" if "haiku" in lower else DEFAULT_MODEL
+        return "glm-5.5" if "haiku" in lower else DEFAULT_MODEL
     if lower.startswith(("gpt-", "chatgpt-", "codex-", "o1", "o3", "o4")):
         return DEFAULT_MODEL
     for model in SUPPORTED_MODELS:
@@ -2906,12 +2910,12 @@ def normalize_reasoning_effort(value: Any = _MISSING) -> str:
 def coerce_reasoning_effort_for_model(model: str, effort: str) -> str:
     """Clamp the requested effort to what the selected model supports (2026-08 UI):
 
-    glm-5.3 / x-preview-l: low/high/max; glm-5.2: high/max (no low tier);
+    glm-5.3 / x-preview-l / glm-5.5: low/high/max (glm-5.5 provisional, pending release);
     GLM-5-Turbo: thinking toggle only -- effort is never sent in features, so
     the stored value only mirrors the official UI's chat-level field.
     """
     normalized = normalize_reasoning_effort(effort)
-    if normalized == "low" and model not in (DEFAULT_MODEL, FLASH_MODEL):
+    if normalized == "low" and model not in (DEFAULT_MODEL, FLASH_MODEL, "glm-5.5"):
         return "high"
     return normalized
 
@@ -16856,7 +16860,7 @@ def write_evidence(har: dict[str, Any], out_dir: Path) -> None:
     with (out_dir / "proxy_boundary_matrix.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["field", "source", "observed", "role_in_request"])
-        writer.writerow(["model", "request body", "glm-5.3 / x-preview-l / GLM-5-Turbo / glm-5.2", "select upstream model"])
+        writer.writerow(["model", "request body", "glm-5.3 / x-preview-l / GLM-5-Turbo / glm-5.5", "select upstream model"])
         writer.writerow(["Authorization", "signin token", "Bearer <redacted>", "session auth"])
         writer.writerow(["token", "query string", "<same token, redacted>", "browser telemetry/signature context"])
         writer.writerow(["X-Signature", "front-end HMAC", "sha256 hmac", "request integrity check"])

@@ -62,7 +62,7 @@ class StreamAndCaptchaCases:
                 self.original_stream(
                     state,
                     "hi",
-                    options=app.ChatOptions(model="glm-5.2"),
+                    options=app.ChatOptions(model="glm-5.5"),
                     retry_wait_sec=0,
                     retry_attempts=3,
                 )
@@ -130,7 +130,7 @@ class StreamAndCaptchaCases:
                 self.original_stream(
                     state,
                     "hi",
-                    options=app.ChatOptions(model="glm-5.2"),
+                    options=app.ChatOptions(model="glm-5.5"),
                     context_out=context,
                     retry_wait_sec=0,
                     retry_attempts=3,
@@ -252,7 +252,7 @@ class StreamAndCaptchaCases:
                 self.original_stream(
                     state,
                     "hi",
-                    options=app.ChatOptions(model="glm-5.2"),
+                    options=app.ChatOptions(model="glm-5.5"),
                     retry_wait_sec=0,
                     retry_attempts=1,
                 )
@@ -318,7 +318,7 @@ class StreamAndCaptchaCases:
                 self.original_stream(
                     state,
                     "retry incomplete",
-                    options=app.ChatOptions(model="glm-5.2"),
+                    options=app.ChatOptions(model="glm-5.5"),
                     retry_wait_sec=0,
                     retry_attempts=2,
                 )
@@ -696,7 +696,7 @@ class StreamAndCaptchaCases:
                     self.original_stream(
                         state,
                         "partial eof",
-                        options=app.ChatOptions(model="glm-5.2", delete_chat_after_completion=False),
+                        options=app.ChatOptions(model="glm-5.5", delete_chat_after_completion=False),
                         context_out=context,
                         retry_attempts=1,
                         history_ctx={
@@ -735,7 +735,7 @@ class StreamAndCaptchaCases:
                 "POST",
                 "/v1/chat/completions",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": "partial eof"}],
                     "stream": False,
                     "delete_chat_after_completion": False,
@@ -780,7 +780,7 @@ class StreamAndCaptchaCases:
             events = self.original_stream(
                 state,
                 "hi",
-                options=app.ChatOptions(model="glm-5.2"),
+                options=app.ChatOptions(model="glm-5.5"),
                 retry_wait_sec=0,
                 retry_attempts=1,
             )
@@ -947,7 +947,7 @@ class StreamAndCaptchaCases:
                 "POST",
                 "/v1/chat/completions",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": "天气"}],
                     "tools": [
                         {
@@ -1020,7 +1020,7 @@ class StreamAndCaptchaCases:
                 "POST",
                 "/v1/chat/completions",
                 {
-                    "model": "glm-5.2",
+                    "model": "glm-5.5",
                     "messages": [{"role": "user", "content": "天气"}],
                     "tools": [
                         {
@@ -1321,7 +1321,7 @@ class StreamAndCaptchaCases:
                 self.original_stream(
                     state,
                     "hi",
-                    options=app.ChatOptions(model="glm-5.2"),
+                    options=app.ChatOptions(model="glm-5.5"),
                     retry_wait_sec=0,
                     retry_attempts=3,
                 )
@@ -1368,7 +1368,7 @@ class StreamAndCaptchaCases:
 
             app.get_happydom_captcha = _no_solve
             self.assertEqual(
-                "pooled-captcha", app.resolve_fresh_captcha(state, "glm-5.2", None, timeout_ms=1000)
+                "pooled-captcha", app.resolve_fresh_captcha(state, "glm-5.5", None, timeout_ms=1000)
             )
             self.assertEqual([], list(app._CAPTCHA_POOL), "池命中后应取走条目")
         finally:
@@ -1513,7 +1513,7 @@ class StreamAndCaptchaCases:
                         "request": {
                             "url": "https://zchat.z.ai/api/v2/chat/completions?user_id=worker-user",
                             "headers": [{"name": "user-agent", "value": "worker-agent"}],
-                            "postData": {"text": json.dumps({"model": "glm-5.2"})},
+                            "postData": {"text": json.dumps({"model": "glm-5.5"})},
                         },
                         "response": {"status": 200},
                     },
@@ -1590,7 +1590,7 @@ class StreamAndCaptchaCases:
         try:
             app._CAPTCHA_MODE = "browser"
             app._set_captcha_degraded(-3600)
-            result = app.resolve_fresh_captcha(fake_state(), "glm-5.2", BrowserWorker(), timeout_ms=1000)
+            result = app.resolve_fresh_captcha(fake_state(), "glm-5.5", BrowserWorker(), timeout_ms=1000)
             self.assertEqual("browser-captcha", result)
             self.assertEqual(1, len(app._CAPTCHA_POOL), "browser 模式不能消费 happy-dom 预热池")
         finally:
@@ -1679,7 +1679,7 @@ class StreamAndCaptchaCases:
                 self.original_stream(
                     state,
                     "hi",
-                    options=app.ChatOptions(model="glm-5.2"),
+                    options=app.ChatOptions(model="glm-5.5"),
                     fresh_captcha_browser=True,
                     retry_wait_sec=3,
                     retry_attempts=3,
@@ -1707,7 +1707,7 @@ class StreamAndCaptchaCases:
         request = Request(
             self.base_url + "/v1/messages",
             data=json.dumps(
-                {"model": "glm-5.2", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
+                {"model": "glm-5.5", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]}
             ).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -1735,7 +1735,7 @@ class StreamAndCaptchaCases:
         status, body = self.request(
             "POST",
             "/v1/chat/completions",
-            {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}]},
+            {"model": "glm-5.5", "messages": [{"role": "user", "content": "hi"}]},
         )
         self.assertEqual(503, status)
         self.assertIn("server_error", body)
