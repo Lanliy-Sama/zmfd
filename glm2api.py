@@ -8834,10 +8834,16 @@ def split_generated_context_text(text: str, kind: str, model: str) -> list[str]:
 
 
 def current_input_file_prompt(has_tools_file: bool) -> str:
-    prompt = "The attached file holds the earlier conversation. Read it through to its end and respond to the most recent user request directly."
+    # 2026-10 上游变化：附件只能通过服务端的文件读取工具读取（不再直接可见于
+    # 输入框），因此所有附件提示词都显式要求模型使用该工具。
+    prompt = (
+        "The attached file holds the earlier conversation. Use the server-side file-reading tool to read it "
+        "through to its end and respond to the most recent user request directly."
+    )
     prompt += (
         " The conversation may be split across multiple attachments; when segment headers are present, read every "
-        "segment in numeric header order through its end before answering."
+        "segment in numeric header order through its end before answering. Read every attachment with the "
+        "server-side file-reading tool before relying on its contents."
     )
     if has_tools_file:
         prompt += (
@@ -8957,8 +8963,8 @@ def apply_parallel_tool_setting(policy: ToolChoice, body: dict[str, Any]) -> Too
 
 
 COMPACTION_PROMPT_PREFIX = (
-    "The attached files contain the conversation to compact. Read every segment in numeric header order "
-    "through its end, then follow the instructions below.\n\n"
+    "The attached files contain the conversation to compact. Use the server-side file-reading tool to read "
+    "every segment in numeric header order through its end, then follow the instructions below.\n\n"
 )
 
 
@@ -11052,10 +11058,11 @@ def plan_staged_context_files(
 def context_preload_prompt(wave: int, waves: int, files: int) -> str:
     """Explain an intentionally incomplete context-loading turn to GLM-5.3."""
     return (
-        f"Context preload batch {wave}/{waves}: read all {files} attached text files and retain their contents. "
-        "When numbered segment headers are present, follow their numeric order and read every attached file through "
-        "its end. Do not answer the user's request or invoke a function yet; begin reasoning about the loaded context "
-        "and wait for the continuation message with the remaining files and final instructions."
+        f"Context preload batch {wave}/{waves}: use the server-side file-reading tool to read all {files} attached "
+        "text files through their ends and retain their contents. When numbered segment headers are present, "
+        "follow their numeric order and read every attached file through its end. Do not answer the user's request "
+        "or invoke a function yet; begin reasoning about the loaded context and wait for the continuation message "
+        "with the remaining files and final instructions."
     )
 
 
@@ -11064,7 +11071,8 @@ def staged_context_final_prompt(prompt: str, preload_waves: int) -> str:
     return (
         f"Continue from the {preload_waves} context preload turn(s) immediately before this message. Those turns "
         "were intentionally stopped during reasoning after loading earlier numbered segments. Combine that retained "
-        "context with every attachment on this message, then execute the final instructions below.\n\n"
+        "context with every attachment on this message; read every attachment with the server-side file-reading "
+        "tool, then execute the final instructions below.\n\n"
         + str(prompt or "")
     )
 
