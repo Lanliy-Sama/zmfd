@@ -1513,7 +1513,8 @@ class ToolAndContextCases:
         trace: dict[str, object] = {}
         prompt, files = app.prepare_protocol_upstream_request(fake_state(), request, trace_out=trace)
 
-        self.assertEqual(app.current_input_file_prompt(False), prompt)
+        self.assertTrue(prompt.startswith(app.current_input_file_prompt(False)))
+        self.assertIn("Attachment URLs", prompt)
         self.assertNotIn("Output integrity guard", prompt)
         self.assertEqual(1, len(files))
         self.assertEqual(1, len(self.uploads))

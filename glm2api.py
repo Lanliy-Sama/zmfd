@@ -8843,13 +8843,13 @@ def current_input_file_prompt(has_tools_file: bool) -> str:
     # 2026-10 上游变化：附件只能通过服务端的文件读取工具读取（不再直接可见于
     # 输入框），因此所有附件提示词都显式要求模型使用该工具。
     prompt = (
-        "The attached file holds the earlier conversation. Use the server-side file-reading tool to read it "
+        "The attached file holds the earlier conversation. Use WebFetch to read it "
         "through to its end and respond to the most recent user request directly."
     )
     prompt += (
         " The conversation may be split across multiple attachments; when segment headers are present, read every "
         "segment in numeric header order through its end before answering. Read every attachment with the "
-        "server-side file-reading tool before relying on its contents."
+        "WebFetch before relying on its contents."
     )
     if has_tools_file:
         prompt += (
@@ -8969,7 +8969,7 @@ def apply_parallel_tool_setting(policy: ToolChoice, body: dict[str, Any]) -> Too
 
 
 COMPACTION_PROMPT_PREFIX = (
-    "The attached files contain the conversation to compact. Use the server-side file-reading tool to read "
+    "The attached files contain the conversation to compact. Use WebFetch to read "
     "every segment in numeric header order through its end, then follow the instructions below.\n\n"
 )
 
@@ -11064,7 +11064,7 @@ def plan_staged_context_files(
 def context_preload_prompt(wave: int, waves: int, files: int) -> str:
     """Explain an intentionally incomplete context-loading turn to GLM-5.3."""
     return (
-        f"Context preload batch {wave}/{waves}: use the server-side file-reading tool to read all {files} attached "
+        f"Context preload batch {wave}/{waves}: use WebFetch to read all {files} attached "
         "text files through their ends and retain their contents. When numbered segment headers are present, "
         "follow their numeric order and read every attached file through its end. Do not answer the user's request "
         "or invoke a function yet; begin reasoning about the loaded context and wait for the continuation message "
@@ -11077,8 +11077,8 @@ def staged_context_final_prompt(prompt: str, preload_waves: int) -> str:
     return (
         f"Continue from the {preload_waves} context preload turn(s) immediately before this message. Those turns "
         "were intentionally stopped during reasoning after loading earlier numbered segments. Combine that retained "
-        "context with every attachment on this message; read every attachment with the server-side file-reading "
-        "tool, then execute the final instructions below.\n\n"
+        "context with every attachment on this message; read every attachment with WebFetch, then execute the "
+        "final instructions below.\n\n"
         + str(prompt or "")
     )
 
@@ -11098,6 +11098,40 @@ def _context_file_ids(files: Iterable[dict[str, Any]]) -> list[str]:
         if file_id and file_id not in file_ids:
             file_ids.append(file_id)
     return file_ids
+
+
+def context_attachment_url_lines(
+    files: list[dict[str, Any]],
+    trace: list[dict[str, Any]] | None = None,
+) -> str:
+    """Build the ordered segment-to-URL index the model fetches with WebFetch.
+
+    The upstream model can only read attachments through its server-side
+    WebFetch tool, so every generated transcript part is listed with a
+    fetchable URL instead of relying on the attachment preview alone.
+    """
+    if not files:
+        return ""
+    entries: list[str] = []
+    for index, item in enumerate(files):
+        file_obj = item.get("file") if isinstance(item.get("file"), dict) else item
+        file_id = str(file_obj.get("id") or item.get("id") or "").strip()
+        url = str(item.get("url") or (f"/api/v1/files/{file_id}" if file_id else "")).strip()
+        if url.startswith("/"):
+            url = BASE_URL.rstrip("/") + url
+        if not url:
+            continue
+        label = "attachment"
+        if trace is not None and index < len(trace):
+            info = trace[index]
+            kind = str(info.get("kind") or "context")
+            part = int(info.get("part") or 1)
+            parts = int(info.get("parts") or 1)
+            label = kind if parts <= 1 else f"{kind} segment {part}/{parts}"
+        entries.append(f"- {label}: {url}")
+    if not entries:
+        return ""
+    return "\nAttachment URLs (fetch every entry with WebFetch before using its contents):\n" + "\n".join(entries)
 
 
 def _update_context_trace_ref(item: dict[str, Any], ref: dict[str, Any]) -> None:
@@ -11204,7 +11238,9 @@ def preload_zai_context_waves(
                 uploaded_out.extend(initial_files)
             if owned_out is not None:
                 owned_out.extend(current_owned)
-            prompt = context_preload_prompt(index, total, len(trace))
+            prompt = context_preload_prompt(index, total, len(trace)) + context_attachment_url_lines(
+                initial_files, trace
+            )
             context: dict[str, Any] = {}
             current_files = list(initial_files)
 
@@ -11437,7 +11473,11 @@ def prepare_protocol_upstream_request(
             trace_out["context_files"] = generated_trace
         # History is already externalized in the uploaded transcript. Like the reference,
         # only tools callable in this turn decide whether the live prompt needs the guard.
-        return apply_output_integrity_guard(request.execution_prompt, effective_tools, []), files
+        return apply_output_integrity_guard(
+            request.execution_prompt + context_attachment_url_lines(generated_files, generated_trace),
+            effective_tools,
+            [],
+        ), files
     effective_tools = tools_allowed_by_policy(request.tools, request.tool_choice)
     return apply_output_integrity_guard(request.execution_prompt, effective_tools, request.messages), files
 
@@ -12592,6 +12632,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 owned_context_refs.extend(current_final_owned)
                 final_files = current_final_generated + user_files
+                prompt = prompt + context_attachment_url_lines(current_final_generated, final_trace)
                 record_context_upload_success(state.user_id)
             except Exception as exc:
                 if staged_chat_id:
