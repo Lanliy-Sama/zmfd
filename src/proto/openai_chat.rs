@@ -7,7 +7,7 @@ use crate::proto::*;
 use crate::state::AppState;
 use crate::tools::ToolDef;
 use crate::util::{estimate_tokens, now_secs, uuid_hex};
-use axum::extract::Bytes;
+use axum::body::Bytes;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
