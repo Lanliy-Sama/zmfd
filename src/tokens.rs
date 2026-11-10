@@ -1,4 +1,12 @@
 //! 上游访问令牌管理：refresh_token 账号池轮转、自动刷新、游客回退。
+//!
+//! refresh_token（长期，浏览器 Cookie 里的 chatglm_refresh_token）
+//!   │  POST /chatglm/user-api/user/refresh  (Authorization: Bearer <refresh_token>, body {})
+//!   ▼
+//! { access_token, refresh_token }  ← refresh_token 会轮换，必须写回
+//!   │  Authorization: Bearer <access_token>
+//!   ▼
+//! /chatglm/agent-api/chat/stream
 
 use crate::error::GatewayError;
 use crate::state::AppState;
