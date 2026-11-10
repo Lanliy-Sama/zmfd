@@ -130,7 +130,7 @@ pub fn content_to_text(content: Option<&Value>) -> Result<String, GatewayError> 
     }
 }
 
-/// Anthropic tool_result 的 content 提取（字符串或 [{type:"text",text}]）。
+/// Anthropic tool_result 的 content 提取（字符串或 [{type:"text",text}] 或 [{type:"tool_result"...}]）。
 pub fn tool_result_text(content: Option<&Value>) -> String {
     match content {
         None | Some(Value::Null) => String::new(),
