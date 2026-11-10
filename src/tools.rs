@@ -232,7 +232,8 @@ fn arguments_to_json(value: Option<&Value>) -> String {
                 }
             }
             // 无法解析时包一层，保证始终是合法 JSON 对象。
-            serde_json::to_string(&json_object_with("value", s)).unwrap_or("{}".to_string())
+            serde_json::to_string(&json_object_with("value", &Value::String(s.clone())))
+                .unwrap_or("{}".to_string())
         }
         Some(other) => serde_json::to_string(&json_object_with("value", other))
             .unwrap_or("{}".to_string()),
