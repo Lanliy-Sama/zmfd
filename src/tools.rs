@@ -387,7 +387,7 @@ mod tests {
         let all: Vec<SplitPiece> = [a, b, c].concat();
         for piece in &all {
             if let SplitPiece::Text(t) = piece {
-                assert!(!t.contains("<tool>"), "开标签泄漏为正文: {t:?");
+                assert!(!t.contains("<tool>"), "开标签泄漏为正文: {t:?}");
             }
         }
         let text: String = all
