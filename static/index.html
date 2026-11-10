@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>agentmore2api 配置面板</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --card2: #1e222b; --border: #2a2f3a;
+    --text: #e6e9ef; --muted: #8b93a3; --accent: #4f8cff; --ok: #34c77b; --warn: #f0a73c; --err: #ef6461;
+    font-size: 14px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; color: var(--accent); }
+  label { display: block; margin: 10px 0 4px; color: var(--muted); font-size: 12px; }
+  input[type=text], input[type=password], input[type=number], select, textarea {
+    width: 100%; background: var(--card2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-size: 13px; outline: none;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 64px; font-family: Consolas, monospace; }
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--text); font-size: 13px; }
+  .check input { accent-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 11px; margin-top: 4px; line-height: 1.5; }
+  .btns { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+  button { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; font-size: 14px; cursor: pointer; }
+  button.ghost { background: var(--card2); border: 1px solid var(--border); color: var(--text); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .pills { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
+  .pill { background: var(--card2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; font-size: 12px; color: var(--muted); }
+  .pill b { color: var(--text); }
+  .pill.ok b { color: var(--ok); } .pill.warn b { color: var(--warn); } .pill.err b { color: var(--err); }
+  #toast { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 99; }
+  .toast { background: var(--card2); border: 1px solid var(--border); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: 8px; font-size: 13px; max-width: 420px; }
+  .toast.ok { border-left-color: var(--ok); } .toast.err { border-left-color: var(--err); }
+  #loginMask { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: center; justify-content: center; z-index: 100; }
+  #loginMask .box { width: 320px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
+  pre.log { background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<div id="loginMask" style="display:none">
+  <div class="box">
+    <h2>面板登录</h2>
+    <label>访问密码</label>
+    <input type="password" id="loginPwd" placeholder="请输入面板密码" />
+    <div class="btns"><button id="loginBtn">进入</button></div>
+    <div class="hint">密码在配置文件 panel_password 字段设置；留空表示无密码。</div>
+  </div>
+</div>
+
+<div class="wrap">
+  <h1>agentmore2api 配置面板</h1>
+  <div class="sub">agentmore.chatglm.cn（对话模式）反向网关 · OpenAI Chat Completions / OpenAI Responses / Anthropic Messages · 每次调用新建会话并以文件发送上下文</div>
+
+  <div class="pills" id="statusPills">
+    <span class="pill">版本 <b id="pVer">-</b></span>
+    <span class="pill">并发 <b id="pConc">-</b></span>
+    <span class="pill">账号 <b id="pAcc">-</b></span>
+    <span class="pill">上游 <b id="pUp">-</b></span>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <h2>监听与并发</h2>
+      <div class="row">
+        <div>
+          <label>监听地址（改后需重启）</label>
+          <input type="text" id="f_host" />
+        </div>
+        <div>
+          <label>端口（改后需重启）</label>
+          <input type="number" id="f_port" />
+        </div>
+      </div>
+      <label>上游最大并发（1 ~ 3）</label>
+      <input type="number" id="f_max_concurrency" min="1" max="3" />
+      <div class="hint">上游对并发敏感，超过会被限流；超限请求排队等待而非报错。</div>
+      <label>代理（可选，如 http://127.0.0.1:7897）</label>
+      <input type="text" id="f_proxy" />
+    </div>
+
+    <div class="card">
+      <h2>上游参数</h2>
+      <label>上游基址</label>
+      <input type="text" id="f_base_url" />
+      <label>assistant_id（网页 URL /chat/&lt;agent_id&gt;/&lt;conv&gt; 中的 agent_id）</label>
+      <input type="text" id="f_assistant_id" />
+      <div class="row">
+        <div>
+          <label>chat_mode</label>
+          <input type="text" id="f_chat_mode" />
+        </div>
+        <div>
+          <label>默认思考强度</label>
+          <select id="f_default_effort">
+            <option value="low">low（快）</option>
+            <option value="high">high（深）</option>
+            <option value="max">max（极致）</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>默认上游模型（selected_model）</label>
+          <input type="text" id="f_selected_model" />
+        </div>
+        <div>
+          <label>上传 from 字段</label>
+          <input type="text" id="f_upload_from" />
+        </div>
+      </div>
+      <label>X-Sign 签名密钥（官方前端公开常量）</label>
+      <input type="text" id="f_sign_secret" />
+      <label>上下文投递方式</label>
+      <select id="f_context_send_mode">
+        <option value="file">file（上传为附件，推荐）</option>
+        <option value="inline">inline（压平进消息文本）</option>
+      </select>
+      <label>上下文最大字符数（超出截断）</label>
+      <input type="number" id="f_max_context_chars" />
+      <div class="row">
+        <div>
+          <label>流空闲超时（秒）</label>
+          <input type="number" id="f_stream_idle_timeout_secs" />
+        </div>
+        <div>
+          <label>总时长上限（秒）</label>
+          <input type="number" id="f_total_timeout_secs" />
+        </div>
+      </div>
+      <div class="check"><input type="checkbox" id="f_is_networking" /><span>允许上游联网搜索</span></div>
+      <div class="check"><input type="checkbox" id="f_delete_conversation" /><span>请求结束后删除上游会话</span></div>
+      <div class="check"><input type="checkbox" id="f_debug_log" /><span>调试日志（打印上游原始 SSE 行）</span></div>
+    </div>
+
+    <div class="card">
+      <h2>账号凭据</h2>
+      <label>refresh_token 账号池（每行一个）</label>
+      <textarea id="f_accounts" placeholder="浏览器登录 agentmore.chatglm.cn 后：DevTools → Application → Cookies → chatglm_refresh_token"></textarea>
+      <div class="check"><input type="checkbox" id="f_guest_fallback" /><span>无账号时回退游客令牌</span></div>
+      <div class="hint">refresh_token 会自动轮换并写回配置文件；多账号自动轮转。</div>
+    </div>
+
+    <div class="card">
+      <h2>模型与安全</h2>
+      <label>对外的模型列表（每行一个，/v1/models 展示）</label>
+      <textarea id="f_models"></textarea>
+      <label>模型别名（每行 “别名=上游模型”）</label>
+      <textarea id="f_model_aliases" placeholder="gpt-4o=glm-5.3"></textarea>
+      <label>未知模型策略</label>
+      <select id="f_unknown_model_policy">
+        <option value="default">default（映射到默认上游模型）</option>
+        <option value="passthrough">passthrough（原样传给上游）</option>
+      </select>
+      <label>网关 API Key（每行一个；留空表示不鉴权）</label>
+      <textarea id="f_api_keys"></textarea>
+      <label>面板访问密码（留空 = 不鉴权，仅建议本机监听时使用）</label>
+      <input type="password" id="f_panel_password" />
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>连通性测试</h2>
+      <div class="btns" style="margin-top:0">
+        <button class="ghost" id="btnTestTokens">测试账号 / 游客令牌</button>
+        <button class="ghost" id="btnTestChat">测试对话往返（消耗一次上游调用）</button>
+      </div>
+      <pre class="log" id="testLog">（测试结果将显示在这里）</pre>
+    </div>
+  </div>
+
+  <div class="btns">
+    <button id="btnSave">保存配置</button>
+    <button class="ghost" id="btnReload">放弃修改并重新加载</button>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+(function () {
+  var cfg = null;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function toast(msg, ok) {
+    var el = document.createElement('div');
+    el.className = 'toast ' + (ok === false ? 'err' : 'ok');
+    el.textContent = msg;
+    $('toast').appendChild(el);
+    setTimeout(function () { el.remove(); }, 5000);
+  }
+
+  function headers() {
+    var h = { 'Content-Type': 'application/json' };
+    var pwd = sessionStorage.getItem('zmfd_panel_pwd');
+    if (pwd) h['X-Panel-Password'] = pwd;
+    return h;
+  }
+
+  function api(method, url, body) {
+    return fetch(url, { method: method, headers: headers(), body: body ? JSON.stringify(body) : undefined })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); });
+  }
+
+  function lines(v) { return (v || []).join('\n'); }
+  function toLines(t) {
+    return (t || '').split('\n').map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+  }
+  function toAliasMap(t) {
+    var map = {};
+    toLines(t).forEach(function (line) {
+      var i = line.indexOf('=');
+      if (i > 0) map[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+    });
+    return map;
+  }
+  function aliasLines(m) {
+    return Object.keys(m || {}).map(function (k) { return k + '=' + m[k]; }).join('\n');
+  }
+
+  function fillForm(c) {
+    cfg = c;
+    $('f_host').value = c.host; $('f_port').value = c.port;
+    $('f_max_concurrency').value = c.max_concurrency;
+    $('f_proxy').value = c.proxy || '';
+    $('f_base_url').value = c.upstream.base_url;
+    $('f_assistant_id').value = c.upstream.assistant_id;
+    $('f_chat_mode').value = c.upstream.chat_mode;
+    $('f_default_effort').value = c.upstream.default_effort;
+    $('f_selected_model').value = c.upstream.selected_model;
+    $('f_upload_from').value = c.upstream.upload_from;
+    $('f_sign_secret').value = c.upstream.sign_secret;
+    $('f_context_send_mode').value = c.upstream.context_send_mode;
+    $('f_max_context_chars').value = c.upstream.max_context_chars;
+    $('f_stream_idle_timeout_secs').value = c.upstream.stream_idle_timeout_secs;
+    $('f_total_timeout_secs').value = c.upstream.total_timeout_secs;
+    $('f_is_networking').checked = !!c.upstream.is_networking;
+    $('f_delete_conversation').checked = !!c.upstream.delete_conversation;
+    $('f_debug_log').checked = !!c.debug_log;
+    $('f_accounts').value = lines(c.accounts);
+    $('f_guest_fallback').checked = !!c.guest_fallback;
+    $('f_models').value = lines(c.models);
+    $('f_model_aliases').value = aliasLines(c.model_aliases);
+    $('f_unknown_model_policy').value = c.unknown_model_policy || 'default';
+    $('f_api_keys').value = lines(c.api_keys);
+    $('f_panel_password').value = c.panel_password || '';
+  }
+
+  function collect() {
+    return {
+      host: $('f_host').value.trim(),
+      port: parseInt($('f_port').value, 10) || 8795,
+      max_concurrency: Math.max(1, Math.min(3, parseInt($('f_max_concurrency').value, 10) || 3)),
+      proxy: $('f_proxy').value.trim(),
+      upstream: {
+        base_url: $('f_base_url').value.trim(),
+        assistant_id: $('f_assistant_id').value.trim(),
+        chat_mode: $('f_chat_mode').value.trim(),
+        default_effort: $('f_default_effort').value,
+        selected_model: $('f_selected_model').value.trim(),
+        upload_from: $('f_upload_from').value.trim(),
+        sign_secret: $('f_sign_secret').value.trim(),
+        context_send_mode: $('f_context_send_mode').value,
+        max_context_chars: parseInt($('f_max_context_chars').value, 10) || 200000,
+        stream_idle_timeout_secs: parseInt($('f_stream_idle_timeout_secs').value, 10) || 90,
+        total_timeout_secs: parseInt($('f_total_timeout_secs').value, 10) || 900,
+        is_networking: $('f_is_networking').checked,
+        delete_conversation: $('f_delete_conversation').checked,
+      },
+      debug_log: $('f_debug_log').checked,
+      accounts: toLines($('f_accounts').value),
+      guest_fallback: $('f_guest_fallback').checked,
+      models: toLines($('f_models').value),
+      model_aliases: toAliasMap($('f_model_aliases').value),
+      unknown_model_policy: $('f_unknown_model_policy').value,
+      api_keys: toLines($('f_api_keys').value),
+      panel_password: $('f_panel_password').value,
+    };
+  }
+
+  function loadConfig() {
+    return api('GET', '/api/config').then(function (r) {
+      if (r.status === 401) { $('loginMask').style.display = 'flex'; return; }
+      fillForm(r.json);
+    }).catch(function (e) { toast('加载配置失败: ' + e, false); });
+  }
+
+  function refreshStatus() {
+    api('GET', '/api/status').then(function (r) {
+      if (r.status === 401) { $('loginMask').style.display = 'flex'; return; }
+      var s = r.json;
+      $('pVer').textContent = s.version || '-';
+      var c = s.concurrency || {};
+      $('pConc').textContent = (c.limit - c.available) + '/' + c.limit;
+      var accs = s.accounts || [];
+      var healthy = accs.filter(function (a) { return a.health === 'healthy'; }).length;
+      $('pAcc').textContent = healthy + '/' + accs.length + (accs.length === 0 ? '（游客' + (s.guest_fallback ? '开' : '关') + '）' : '');
+      $('pUp').textContent = (s.upstream && s.upstream.base_url || '').replace(/^https?:\/\//, '');
+    }).catch(function () {});
+  }
+
+  $('loginBtn').addEventListener('click', function () {
+    sessionStorage.setItem('zmfd_panel_pwd', $('loginPwd').value);
+    api('GET', '/api/config').then(function (r) {
+      if (r.status === 401) { toast('密码错误', false); return; }
+      $('loginMask').style.display = 'none';
+      fillForm(r.json);
+      refreshStatus();
+    });
+  });
+
+  $('btnSave').addEventListener('click', function () {
+    var btn = $('btnSave');
+    btn.disabled = true;
+    api('PUT', '/api/config', collect()).then(function (r) {
+      btn.disabled = false;
+      if (r.status === 401) { $('loginMask').style.display = 'flex'; return; }
+      if (r.json && r.json.ok) { toast('配置已保存并热生效（监听地址/端口需重启）'); loadConfig(); refreshStatus(); }
+      else { toast('保存失败: ' + ((r.json && r.json.error) || r.status), false); }
+    }).catch(function (e) { btn.disabled = false; toast('保存失败: ' + e, false); });
+  });
+
+  $('btnReload').addEventListener('click', loadConfig);
+
+  $('btnTestTokens').addEventListener('click', function () {
+    $('testLog').textContent = '正在测试…';
+    api('POST', '/api/test', { mode: 'tokens' }).then(function (r) {
+      if (r.status === 401) { $('loginMask').style.display = 'flex'; return; }
+      $('testLog').textContent = JSON.stringify(r.json, null, 2);
+    }).catch(function (e) { $('testLog').textContent = '请求失败: ' + e; });
+  });
+
+  $('btnTestChat').addEventListener('click', function () {
+    $('testLog').textContent = '正在进行对话往返测试…';
+    api('POST', '/api/test', { mode: 'chat' }).then(function (r) {
+      if (r.status === 401) { $('loginMask').style.display = 'flex'; return; }
+      $('testLog').textContent = JSON.stringify(r.json, null, 2);
+    }).catch(function (e) { $('testLog').textContent = '请求失败: ' + e; });
+  });
+
+  loadConfig().then(refreshStatus);
+  setInterval(refreshStatus, 8000);
+})();
+</script>
+</body>
+</html>
