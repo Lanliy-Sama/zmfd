@@ -90,7 +90,8 @@ pub fn parse(body: &Value, cfg: &Config) -> Result<CanonRequest, GatewayError> {
                                         .to_string();
                                     canon.messages.push(m);
                                 }
-                                // image 等不支持的内容：tool_result 已单独处理，这里忽略其余类型。
+                                // image 等不支持的内容在 content_to_text 语义下报错更诚实，
+                                // 但 tool_result 已单独处理，这里忽略其余类型。
                                 _ => {}
                             }
                         }
