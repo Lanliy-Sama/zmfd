@@ -16,11 +16,13 @@ mod proto;
 mod sign;
 mod state;
 mod tokens;
+mod tools;
 mod upstream;
 mod util;
 
-use axum::extract::{Bytes, DefaultBodyLimit};
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
+use axum::http::HeaderMap;
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -147,7 +149,7 @@ async fn log_mw(req: axum::extract::Request, next: Next) -> Response {
     resp
 }
 
-fn panel_index() -> Html<&'static str> {
+async fn panel_index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 

@@ -195,8 +195,10 @@ impl Config {
     }
 
     pub fn save_to(&self, path: &PathBuf) -> Result<(), String> {
-        self.normalize();
-        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        // normalize 需要 &mut；对快照做规范化，保持 &self 签名不变。
+        let mut snapshot = self.clone();
+        snapshot.normalize();
+        let json = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("写入配置失败: {e}"))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("替换配置失败: {e}"))?;

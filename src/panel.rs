@@ -4,7 +4,7 @@ use crate::error::GatewayError;
 use crate::pipeline;
 use crate::proto::{CanonMessage, CanonRequest, Role};
 use crate::state::AppState;
-use axum::extract::Bytes;
+use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
