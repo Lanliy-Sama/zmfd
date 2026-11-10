@@ -1,0 +1,28 @@
+[package]
+name = "agentmore2api"
+version = "1.0.0"
+edition = "2021"
+description = "agentmore.chatglm.cn (chat mode) reverse gateway: OpenAI Chat Completions / OpenAI Responses / Anthropic Messages"
+license = "MIT"
+
+[[bin]]
+name = "agentmore2api"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+axum = { version = "0.7", features = ["json", "tokio", "http1"] }
+tower-http = { version = "0.6", features = ["cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+md-5 = "0.10"
+
+[profile.release]
+opt-level = 2
+lto = false
+strip = true

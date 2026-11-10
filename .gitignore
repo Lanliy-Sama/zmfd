@@ -1,37 +1,15 @@
-# Local credentials and captures must never be versioned.
-profiles.local.json
-apikey.local.json
-pending_deletes.local.json
-*.har
+# Rust
+/target
+Cargo.lock
 
-# Python runtime artifacts.
-__pycache__/
-*.py[cod]
-
-# Local diagnostics.
+# 本地运行数据
+config.json
 *.log
-settings.local.json
-history.local.json
-history.local.json.d/
-*.bak*
-*.tmp
-*.temp
+ref/
+data/
 
-# Local test/build state.
-.coverage
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Local baseline snapshots and harness metadata.
-baseline/
-.zcode/
-
-# happy-dom captcha solver (local-only).
-node_modules/
-
-# Rotated runtime logs.
-logs/
-
-# Captured third-party frontend bundle used only for local protocol analysis.
-docs/zai-frontend-bundle.js
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
