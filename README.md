@@ -75,12 +75,12 @@ X-Sign 签名密钥是官方网页端 JS 中的公开协议指纹常量，已内
 
 ## 构建
 
-推送到 GitHub 后由 `.github/workflows/build.yml` 自动构建（不要本地构建时可直接下载 Actions 产物）：
+推送到 GitHub 后由 `.github/workflows/build.yml` 自动构建：
 
 - `agentmore2api-linux-x64.tar.gz`
 - `agentmore2api-windows-x64.zip`
 
-打 `v*` 标签或手动 workflow_dispatch 时会同时创建 Release。
+提交信息带 `[release]` 标记或推送 `v*` 标签时会自动创建 GitHub Release，附件可直接公开下载（Actions 页面的 artifact 需要 GitHub 登录才能下载，Release 附件不需要）。
 
 ## 调试
 
