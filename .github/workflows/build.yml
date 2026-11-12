@@ -72,8 +72,8 @@ jobs:
   release:
     name: release
     needs: build
-    # 触发方式：提交信息带 [release] 标记，或推送 v* 标签。
-    if: startsWith(github.ref, 'refs/tags/v') || contains(github.event.head_commit.message, '[release]')
+    # 触发方式：提交信息带 [release] 标记，推送 v* 标签，或 Actions 页手动 Run（workflow_dispatch）。
+    if: startsWith(github.ref, 'refs/tags/v') || contains(github.event.head_commit.message, '[release]') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
