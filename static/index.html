@@ -100,7 +100,7 @@
           <input type="text" id="f_chat_mode" />
         </div>
         <div>
-          <label>默认思考强度</label>
+          <label>默认思考强度（客户端未指定时）</label>
           <select id="f_default_effort">
             <option value="low">low（快）</option>
             <option value="high">high（深）</option>
@@ -108,6 +108,13 @@
           </select>
         </div>
       </div>
+      <label>强制思考强度（覆盖客户端请求，留空跟随客户端）</label>
+      <select id="f_effort_override">
+        <option value="">跟随客户端</option>
+        <option value="low">low（快）</option>
+        <option value="high">high（深）</option>
+        <option value="max">max（极致）</option>
+      </select>
       <div class="row">
         <div>
           <label>默认上游模型（selected_model）</label>
@@ -234,6 +241,7 @@
     $('f_assistant_id').value = c.upstream.assistant_id;
     $('f_chat_mode').value = c.upstream.chat_mode;
     $('f_default_effort').value = c.upstream.default_effort;
+    $('f_effort_override').value = c.upstream.effort_override || '';
     $('f_selected_model').value = c.upstream.selected_model;
     $('f_upload_from').value = c.upstream.upload_from;
     $('f_sign_secret').value = c.upstream.sign_secret;
@@ -264,6 +272,7 @@
         assistant_id: $('f_assistant_id').value.trim(),
         chat_mode: $('f_chat_mode').value.trim(),
         default_effort: $('f_default_effort').value,
+        effort_override: $('f_effort_override').value,
         selected_model: $('f_selected_model').value.trim(),
         upload_from: $('f_upload_from').value.trim(),
         sign_secret: $('f_sign_secret').value.trim(),
