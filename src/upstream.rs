@@ -200,32 +200,37 @@ pub async fn upload_context_file(
 }
 
 /// 构造对话模式流式请求体（与官方 ChatList 的 Che 函数构造一致的字段集）。
+/// files 为按阅读顺序排列的附件（多文件合入同一个 file 块数组，order 递增）。
 pub fn build_chat_body(
     cfg: &UpstreamConfig,
     instruction: &str,
-    file: Option<&UploadedFile>,
+    files: &[UploadedFile],
     effort: &str,
     selected_model: &str,
 ) -> Value {
     let mut content = vec![json!({"type": "text", "text": instruction})];
-    if let Some(f) = file {
+    if !files.is_empty() {
         // 附件块形态实测（官方前端 Che 函数）：file 是数组，元素带
         // url / cover_images / order / width / height 字段，缺任何一个都会
         // 被上游以 {"status":400,"message":"invalid param"} 拒绝。
-        content.push(json!({
-            "type": "file",
-            "file": [{
-                "file_id": f.file_id,
-                "file_name": f.file_name,
-                "file_url": f.file_url,
-                "file_size": f.file_size,
-                "url": f.file_url,
-                "cover_images": Value::Null,
-                "order": 0,
-                "width": 0,
-                "height": 0,
-            }]
-        }));
+        let items: Vec<Value> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                json!({
+                    "file_id": f.file_id,
+                    "file_name": f.file_name,
+                    "file_url": f.file_url,
+                    "file_size": f.file_size,
+                    "url": f.file_url,
+                    "cover_images": Value::Null,
+                    "order": i,
+                    "width": 0,
+                    "height": 0,
+                })
+            })
+            .collect();
+        content.push(json!({"type": "file", "file": items}));
     }
     json!({
         "assistant_id": cfg.assistant_id,
@@ -356,13 +361,12 @@ impl UpParsed {
     }
 }
 
-/// 上游 SSE 流解析器：处理「增量帧 + 全量快照帧」混合推送，产出干净的增量。
+/// 上游 SSE 流解析器：处理「增量帧 + 累积快照帧」混合推送，产出干净的增量。
 ///
-/// 增量语义（实测 agent-api/chat/stream）：
-///   if_increase_push 为 boolean 时直接采用；
-///   否则 = !(meta_data.full)（full 真值 => 快照）；
-///   都缺省（内容帧 meta_data 常为 {}）时用启发式：
-///   新帧以已累积内容为前缀且不短于它 => 快照替换；否则增量追加。
+/// 帧语义（完整帧捕获确认，确定性规则）：
+///   part.status == "init"  => 帧内容为增量（追加）；
+///   part.status == "finish" => 帧内容为该 logic_id 的累积全量（替换）；
+///   帧 meta_data 的 if_increase_push / full 显式标志优先于 part.status。
 pub struct UpstreamParser {
     order: Vec<String>,
     text: HashMap<String, String>,
@@ -465,12 +469,8 @@ impl UpstreamParser {
             }
         }
 
-        // 增量语义判定。
-        // 官方前端语义：if_increase_push 为 boolean 时直接采用；
-        // 否则 = !(meta_data.full)（full 真值 => 全量快照）。
-        // 实测 agent-api/chat/stream 的内容帧 meta_data 为空 {} 且帧内容是
-        // 「增量 + 累积快照」混合推送（如 "测试"→"成功"→"测试成功"→"测试成功"），
-        // 都缺省时用启发式：新帧以已累积内容为前缀且不短于它 => 快照替换；否则增量追加。
+        // 增量/快照判定：帧 meta_data 的显式标志优先；
+        // 缺省时按 part.status 判定（finish=快照替换，init=增量追加）。
         let meta = obj.get("meta_data");
         let increase_mode: Option<bool> = match meta.and_then(|m| m.get("if_increase_push")) {
             Some(Value::Bool(b)) => Some(*b),
@@ -480,9 +480,11 @@ impl UpstreamParser {
             },
         };
 
-        // 本帧内容按 logic_id 归组（保持出现顺序）。
-        let mut frame_text: Vec<(String, String)> = Vec::new();
-        let mut frame_reasoning: Vec<(String, String)> = Vec::new();
+        // 本帧内容按 logic_id 归组（保持出现顺序，并记录 part.status）。
+        // 实测语义（完整帧捕获确认）：part.status=="init" 的帧内容是增量（追加）；
+        // part.status=="finish" 的帧内容是该 logic_id 的累积全量快照（替换）。
+        let mut frame_text: Vec<(String, String, bool)> = Vec::new();
+        let mut frame_reasoning: Vec<(String, String, bool)> = Vec::new();
         if let Some(parts) = obj.get("parts").and_then(Value::as_array) {
             for part in parts {
                 let logic_id = part
@@ -491,6 +493,7 @@ impl UpstreamParser {
                     .or_else(|| part.get("id").and_then(Value::as_str))
                     .unwrap_or("default")
                     .to_string();
+                let is_snapshot = part.get("status").and_then(Value::as_str) == Some("finish");
                 let Some(blocks) = part.get("content").and_then(Value::as_array) else {
                     continue;
                 };
@@ -500,24 +503,24 @@ impl UpstreamParser {
                         "text" => {
                             let t = str_field(block, "text").or_else(|| str_field(block, "content"));
                             if let Some(t) = t {
-                                frame_append(&mut frame_text, &logic_id, &t);
+                                frame_append(&mut frame_text, &logic_id, &t, is_snapshot);
                             }
                         }
                         "think" => {
                             let t = str_field(block, "think").or_else(|| str_field(block, "content"));
                             if let Some(t) = t {
-                                frame_append(&mut frame_reasoning, &logic_id, &t);
+                                frame_append(&mut frame_reasoning, &logic_id, &t, is_snapshot);
                             }
                         }
                         "execution_output" => {
                             if let Some(t) = str_field(block, "content") {
-                                frame_append(&mut frame_text, &logic_id, &t);
+                                frame_append(&mut frame_text, &logic_id, &t, is_snapshot);
                             }
                         }
                         "code" => {
                             if let Some(t) = str_field(block, "code") {
                                 let fenced = format!("```python\n{t}\n```");
-                                frame_append(&mut frame_text, &logic_id, &fenced);
+                                frame_append(&mut frame_text, &logic_id, &fenced, is_snapshot);
                             }
                         }
                         // tool_calls / tool_result / image / file / dir 等平台内部块不消费。
@@ -527,8 +530,9 @@ impl UpstreamParser {
             }
         }
 
-        // 帧内容并入全量状态：显式增量帧追加，显式快照帧替换，缺省时启发式判定。
-        for (id, val) in &frame_text {
+        // 帧内容并入全量状态：显式 meta 标志优先；否则按 part.status 判定
+        // （finish=累积快照替换，init=增量追加）。
+        for (id, val, part_snapshot) in &frame_text {
             if !self.order.contains(id) {
                 self.order.push(id.clone());
             }
@@ -537,22 +541,16 @@ impl UpstreamParser {
                 Some(true) => format!("{cur}{val}"),
                 Some(false) => val.clone(),
                 None => {
-                    let cur_chars: Vec<char> = cur.chars().collect();
-                    let val_chars: Vec<char> = val.chars().collect();
-                    if val_chars.len() >= cur_chars.len()
-                        && val_chars[..cur_chars.len()] == cur_chars[..]
-                    {
-                        // 快照（含与已累积内容相同的重复帧）：替换，差分为新增尾部。
+                    if *part_snapshot {
                         val.clone()
                     } else {
-                        // 增量：追加。
                         format!("{cur}{val}")
                     }
                 }
             };
             self.text.insert(id.clone(), merged);
         }
-        for (id, val) in &frame_reasoning {
+        for (id, val, part_snapshot) in &frame_reasoning {
             if !self.order.contains(id) {
                 self.order.push(id.clone());
             }
@@ -561,11 +559,7 @@ impl UpstreamParser {
                 Some(true) => format!("{cur}{val}"),
                 Some(false) => val.clone(),
                 None => {
-                    let cur_chars: Vec<char> = cur.chars().collect();
-                    let val_chars: Vec<char> = val.chars().collect();
-                    if val_chars.len() >= cur_chars.len()
-                        && val_chars[..cur_chars.len()] == cur_chars[..]
-                    {
+                    if *part_snapshot {
                         val.clone()
                     } else {
                         format!("{cur}{val}")
@@ -630,7 +624,12 @@ fn str_field(v: &Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn frame_append(target: &mut Vec<(String, String)>, id: &str, val: &str) {
+fn frame_append(
+    target: &mut Vec<(String, String, bool)>,
+    id: &str,
+    val: &str,
+    is_snapshot: bool,
+) {
     if val.is_empty() {
         return;
     }
@@ -640,7 +639,7 @@ fn frame_append(target: &mut Vec<(String, String)>, id: &str, val: &str) {
             return;
         }
     }
-    target.push((id.to_string(), val.to_string()));
+    target.push((id.to_string(), val.to_string(), is_snapshot));
 }
 
 /// 与 JS 布尔真值语义一致（用于 meta_data.full）。

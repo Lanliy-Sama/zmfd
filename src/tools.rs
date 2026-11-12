@@ -19,11 +19,28 @@ pub struct ToolDef {
     pub parameters: Value,
 }
 
-/// 把工具定义序列化为注入提示词的指令段。bias_kind/bias_name 描述 tool_choice 的倾向。
+/// 把工具定义序列化为注入提示词的指令段（完整版：格式约定 + Schema 清单）。
+/// 用于内联模式。bias_kind/bias_name 描述 tool_choice 的倾向。
 pub fn instructions(tools: &[ToolDef], bias_kind: &str, bias_name: &str) -> String {
     if tools.is_empty() {
         return String::new();
     }
+    let mut lines: Vec<String> = format_rules_lines(bias_kind, bias_name);
+    lines.push(String::new());
+    lines.push("可用工具：".to_string());
+    for tool in tools {
+        lines.push(format!("- 名称: {}", tool.name));
+        if !tool.description.is_empty() {
+            lines.push(format!("  说明: {}", tool.description));
+        }
+        let schema = compact_json(&tool.parameters);
+        lines.push(format!("  入参 Schema: {schema}"));
+    }
+    lines.push("[/TOOL USE INSTRUCTIONS]".to_string());
+    lines.join("\n")
+}
+
+fn format_rules_lines(bias_kind: &str, bias_name: &str) -> Vec<String> {
     let mut lines: Vec<String> = vec![
         "[TOOL USE INSTRUCTIONS]".to_string(),
         "你可以调用工具。当且仅当需要调用工具时，你的回复中输出如下格式的调用块（可多个，每个一块）：".to_string(),
@@ -42,18 +59,38 @@ pub fn instructions(tools: &[ToolDef], bias_kind: &str, bias_name: &str) -> Stri
         )),
         _ => {}
     }
-    lines.push(String::new());
-    lines.push("可用工具：".to_string());
-    for tool in tools {
-        lines.push(format!("- 名称: {}", tool.name));
-        if !tool.description.is_empty() {
-            lines.push(format!("  说明: {}", tool.description));
-        }
-        let schema = compact_json(&tool.parameters);
-        lines.push(format!("  入参 Schema: {schema}"));
-    }
     lines.push("[/TOOL USE INSTRUCTIONS]".to_string());
-    lines.join("\n")
+    lines
+}
+
+/// 工具调用格式约定（仅格式，不含工具清单）。附件模式下 Schema 单独作为附件 2 上传，
+/// 正文只携带格式约定与文件阅读引导。
+pub fn format_rules(bias_kind: &str, bias_name: &str) -> String {
+    if bias_kind == "none" {
+        return String::new();
+    }
+    format_rules_lines(bias_kind, bias_name).join("\n")
+}
+
+/// 工具定义文档（上传为附件 2）：名称、说明与入参 Schema。
+pub fn tools_document(tools: &[ToolDef]) -> String {
+    let mut s = String::new();
+    s.push_str("# 可用工具定义\n\n");
+    s.push_str(&format!(
+        "共 {} 个工具。调用任何工具前，请先核对本文件中对应工具的入参 Schema；调用块的 arguments 必须是符合 Schema 的合法 JSON 对象。\n\n",
+        tools.len()
+    ));
+    for (i, tool) in tools.iter().enumerate() {
+        s.push_str(&format!("## 工具 {}：{}\n", i + 1, tool.name));
+        if !tool.description.is_empty() {
+            s.push_str(&format!("- 说明：{}\n", tool.description));
+        }
+        s.push_str(&format!(
+            "- 入参 Schema：\n\n```json\n{}\n```\n\n",
+            compact_json(&tool.parameters)
+        ));
+    }
+    s
 }
 
 fn compact_json(value: &Value) -> String {
@@ -232,8 +269,7 @@ fn arguments_to_json(value: Option<&Value>) -> String {
                 }
             }
             // 无法解析时包一层，保证始终是合法 JSON 对象。
-            serde_json::to_string(&json_object_with("value", &Value::String(s.clone())))
-                .unwrap_or("{}".to_string())
+            serde_json::to_string(&json_object_with("value", s)).unwrap_or("{}".to_string())
         }
         Some(other) => serde_json::to_string(&json_object_with("value", other))
             .unwrap_or("{}".to_string()),
@@ -388,7 +424,7 @@ mod tests {
         let all: Vec<SplitPiece> = [a, b, c].concat();
         for piece in &all {
             if let SplitPiece::Text(t) = piece {
-                assert!(!t.contains("<tool>"), "开标签泄漏为正文: {t:?}");
+                assert!(!t.contains("<tool>"), "开标签泄漏为正文: {t:}");
             }
         }
         let text: String = all

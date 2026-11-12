@@ -1,6 +1,6 @@
 [package]
 name = "agentmore2api"
-version = "1.0.6"
+version = "1.0.8"
 edition = "2021"
 description = "agentmore.chatglm.cn (chat mode) reverse gateway: OpenAI Chat Completions / OpenAI Responses / Anthropic Messages"
 license = "MIT"
