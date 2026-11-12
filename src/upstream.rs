@@ -351,9 +351,11 @@ impl UpParsed {
 
 /// 上游 SSE 流解析器：处理「增量帧 + 全量快照帧」混合推送，产出干净的增量。
 ///
-/// 增量语义与官方前端一致：
-///   meta_data.if_increase_push 为 boolean 时直接采用；
-///   否则 = !(meta_data.full)（都缺省 => 增量追加）。
+/// 增量语义（实测 agent-api/chat/stream）：
+///   if_increase_push 为 boolean 时直接采用；
+///   否则 = !(meta_data.full)（full 真值 => 快照）；
+///   都缺省（内容帧 meta_data 常为 {}）时用启发式：
+///   新帧以已累积内容为前缀且不短于它 => 快照替换；否则增量追加。
 pub struct UpstreamParser {
     order: Vec<String>,
     text: HashMap<String, String>,
@@ -378,8 +380,8 @@ impl UpstreamParser {
         if line.is_empty() {
             return None;
         }
-        // 正常 SSE 帧带 "data:" 前缀；业务错误帧（如 -1001 积分不足）是
-        // HTTP 200 内的裸 JSON 行，不带前缀，两种都要接受。
+        // 正常 SSE 帧带 "data:" 前缀；业务错误帧（如 -1001 积分不足、400 invalid param）
+        // 是 HTTP 200 内的裸 JSON 行，不带前缀，两种都要接受。
         let payload = if let Some(rest) = line.strip_prefix("data:") {
             rest.trim()
         } else if line.starts_with('{') {
@@ -434,10 +436,11 @@ impl UpstreamParser {
             .unwrap_or("")
             .to_string();
         if ev.status.is_empty() {
-            // status 可能是数字（如 -1001 积分不足）：负数即业务错误帧。
+            // status 可能是数字（如 -1001 积分不足、400 invalid param）：
+            // 实测上游会用 HTTP 200 + 裸 JSON 帧承载业务错误，非 0/200 的数值状态都是错误帧。
             if let Some(n) = obj.get("status").and_then(Value::as_i64) {
                 ev.status = n.to_string();
-                if n < 0 {
+                if n != 0 && n != 200 {
                     if let Some(t) = str_field(&obj, "message") {
                         ev.error_text = t;
                     }
@@ -447,13 +450,18 @@ impl UpstreamParser {
         }
 
         // 增量语义判定。
+        // 官方前端语义：if_increase_push 为 boolean 时直接采用；
+        // 否则 = !(meta_data.full)（full 真值 => 全量快照）。
+        // 实测 agent-api/chat/stream 的内容帧 meta_data 为空 {} 且帧内容是
+        // 「增量 + 累积快照」混合推送（如 "测试"→"成功"→"测试成功"→"测试成功"），
+        // 都缺省时用启发式：新帧以已累积内容为前缀且不短于它 => 快照替换；否则增量追加。
         let meta = obj.get("meta_data");
-        let increase = match meta.and_then(|m| m.get("if_increase_push")) {
-            Some(Value::Bool(b)) => *b,
-            _ => !meta
-                .and_then(|m| m.get("full"))
-                .map(|v| json_truthy(v))
-                .unwrap_or(false),
+        let increase_mode: Option<bool> = match meta.and_then(|m| m.get("if_increase_push")) {
+            Some(Value::Bool(b)) => Some(*b),
+            _ => match meta.and_then(|m| m.get("full")) {
+                Some(v) => Some(!json_truthy(v)),
+                None => None,
+            },
         };
 
         // 本帧内容按 logic_id 归组（保持出现顺序）。
@@ -503,16 +511,28 @@ impl UpstreamParser {
             }
         }
 
-        // 帧内容并入全量状态：增量帧追加，快照帧替换。
+        // 帧内容并入全量状态：显式增量帧追加，显式快照帧替换，缺省时启发式判定。
         for (id, val) in &frame_text {
             if !self.order.contains(id) {
                 self.order.push(id.clone());
             }
-            let merged = if increase {
-                let cur = self.text.get(id).cloned().unwrap_or_default();
-                format!("{cur}{val}")
-            } else {
-                val.clone()
+            let cur = self.text.get(id).cloned().unwrap_or_default();
+            let merged = match increase_mode {
+                Some(true) => format!("{cur}{val}"),
+                Some(false) => val.clone(),
+                None => {
+                    let cur_chars: Vec<char> = cur.chars().collect();
+                    let val_chars: Vec<char> = val.chars().collect();
+                    if val_chars.len() >= cur_chars.len()
+                        && val_chars[..cur_chars.len()] == cur_chars[..]
+                    {
+                        // 快照（含与已累积内容相同的重复帧）：替换，差分为新增尾部。
+                        val.clone()
+                    } else {
+                        // 增量：追加。
+                        format!("{cur}{val}")
+                    }
+                }
             };
             self.text.insert(id.clone(), merged);
         }
@@ -520,11 +540,21 @@ impl UpstreamParser {
             if !self.order.contains(id) {
                 self.order.push(id.clone());
             }
-            let merged = if increase {
-                let cur = self.reasoning.get(id).cloned().unwrap_or_default();
-                format!("{cur}{val}")
-            } else {
-                val.clone()
+            let cur = self.reasoning.get(id).cloned().unwrap_or_default();
+            let merged = match increase_mode {
+                Some(true) => format!("{cur}{val}"),
+                Some(false) => val.clone(),
+                None => {
+                    let cur_chars: Vec<char> = cur.chars().collect();
+                    let val_chars: Vec<char> = val.chars().collect();
+                    if val_chars.len() >= cur_chars.len()
+                        && val_chars[..cur_chars.len()] == cur_chars[..]
+                    {
+                        val.clone()
+                    } else {
+                        format!("{cur}{val}")
+                    }
+                }
             };
             self.reasoning.insert(id.clone(), merged);
         }
@@ -609,7 +639,7 @@ fn json_truthy(v: &Value) -> bool {
 }
 
 /// 结束状态判定：(是否结束, finish_reason)。None 表示尚未结束。
-/// 负数业务状态码（如 -1001 积分不足）按错误结束处理。
+/// 数值状态码（如 -1001 积分不足、400 invalid param，除 0/200 外）按错误结束处理。
 pub fn status_reason(status: &str) -> Option<(bool, &'static str)> {
     match status {
         "finish" | "stop" => Some((true, "stop")),
@@ -617,7 +647,7 @@ pub fn status_reason(status: &str) -> Option<(bool, &'static str)> {
         "error" => Some((true, "error")),
         _ => {
             if let Ok(n) = status.parse::<i64>() {
-                if n < 0 {
+                if n != 0 && n != 200 {
                     return Some((true, "error"));
                 }
             }
