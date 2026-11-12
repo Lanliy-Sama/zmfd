@@ -12,8 +12,8 @@
 ## 工作方式
 
 1. 每次网关调用都会**新建一次上游对话**（`conversation_id` 留空，由上游自动建会话）；
-2. 客户端传入的完整多轮上下文（含工具调用与工具结果）会被序列化为 Markdown，**以文件附件形式上传**（`POST /chatglm/productivity-api/file/chat_upload`），消息正文只携带任务说明；上传失败自动回退为内联文本；
-3. 上游是 agentmore 的 `agent-api/chat/stream`（`chat_mode=chat_agent`，无沙箱，不需要上游 Read 工具读取附件，模型直接可见文件内容）；
+2. 客户端传入的完整多轮上下文（含工具调用与工具结果）会被序列化为 Markdown，**以文件附件形式上传**（`POST /chatglm/productivity-api/file/chat_upload`），消息正文只携带任务说明；上游拒绝附件或上传失败时自动改用内联文本（按槽位记忆能力，不重复尝试）；
+3. 上游是 agentmore 的 `agent-api/chat/stream`（`chat_mode=chat_agent`，无沙箱，不需要上游 Read 工具读取附件）；
 4. 收到回复后本次会话即结束（可选自动删除上游会话），**下一次调用又是全新会话**；
 5. 上游并发由信号量限制，**最高 3**（面板可调 1~3），超限排队而非报错。
 
@@ -44,6 +44,12 @@ agentmore2api.exe --host 127.0.0.1 --port 8795 --config config.json
 
 1. **refresh_token（推荐）**：浏览器登录 agentmore.chatglm.cn 后，DevTools → Application → Cookies → 复制 `chatglm_refresh_token`，粘贴进面板账号列表。令牌轮换会自动写回配置文件；支持多账号轮转。
 2. **游客回退**：不配置账号时自动走 `POST /chatglm/user-api/guest/access` 免登录令牌（配置 `guest_fallback: true`，默认开启）。
+
+> **实测结论（2026-11-11，基于官方前端逆向 + 真实探针）**：
+> - 游客令牌能通过签名鉴权（令牌/上传接口均 200），但**没有对话积分**——流式请求会被上游以 `status:-1001「剩余积分不足」` 拒绝，无法实际对话。真实对话必须导入带积分的账号 refresh_token。
+> - 游客身份的流式请求**不允许携带文件附件**（HTTP 400），网关会自动降级为内联文本；账号槽位若也被上游拒绝附件，会记忆该能力并自动切换内联。
+> - 上游错误帧有两种形态：SSE `data:` 帧与 HTTP 200 内的裸 JSON 行（如 -1001），网关两者都能解析并转成明确错误信息。
+> - `available_models` 接口确认：游客默认模型 `glm-5.3-flash`，思考档位 `low/high/max`。
 
 X-Sign 签名密钥是官方网页端 JS 中的公开协议指纹常量，已内置默认值，可在面板覆盖。
 

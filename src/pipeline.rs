@@ -111,23 +111,26 @@ async fn pipeline_inner(
     let (token, slot, source) = state.tokens.get_access_token(state).await?;
     eprintln!("[zmfd] upstream slot={slot} source={source} model={selected_model} effort={effort}");
 
-    // 3. 上传上下文文件；失败自动回退内联。
-    let file_name = format!("context-{}.md", now_ms());
+    // 3. 上下文投递：优先上传附件；该槽位被上游拒绝过附件（游客）或配置为内联时直接内联。
+    let can_attach = state.tokens.slot_can_attach(slot).await;
     let mut uploaded: Option<UploadedFile> = None;
-    let mut inline_mode = cfg.upstream.context_send_mode == "inline";
-    if !inline_mode {
+    if can_attach && cfg.upstream.context_send_mode != "inline" {
+        let file_name = format!("context-{}.md", now_ms());
         match upstream::upload_context_file(state, &token, &file_name, doc.clone().into_bytes())
             .await
         {
             Ok(f) => uploaded = Some(f),
             Err(e) => {
-                eprintln!("[zmfd] 上传上下文文件失败，回退内联模式: {e}");
-                inline_mode = true;
+                eprintln!("[zmfd] 上传上下文文件失败，改用内联模式: {e}");
             }
         }
     }
 
-    let instruction = build_instruction(&tool_instr, uploaded.as_ref(), inline_mode, &doc);
+    let inline_instruction = build_instruction_inline(&tool_instr, &doc);
+    let mut instruction = match &uploaded {
+        Some(f) => build_instruction_with_file(&tool_instr, f),
+        None => inline_instruction.clone(),
+    };
     let body = upstream::build_chat_body(
         &cfg.upstream,
         &instruction,
@@ -136,8 +139,30 @@ async fn pipeline_inner(
         &selected_model,
     );
 
-    // 4. 发起对话流。
-    let resp = upstream::chat_stream(state, &token, body).await?;
+    // 4. 发起对话流；消息附件被上游拒绝（HTTP 400）时，标记槽位并以内联上下文重试一次。
+    let resp = match upstream::chat_stream(state, &token, body).await {
+        Ok(r) => r,
+        Err(e) => {
+            if uploaded.is_some() && e.status == 400 {
+                state.tokens.set_slot_attach(slot, false).await;
+                eprintln!(
+                    "[zmfd] 上游拒绝消息附件（HTTP 400），该槽位改用内联上下文重试: {}",
+                    e.message
+                );
+                instruction = inline_instruction.clone();
+                let retry_body = upstream::build_chat_body(
+                    &cfg.upstream,
+                    &instruction,
+                    None,
+                    &effort,
+                    &selected_model,
+                );
+                upstream::chat_stream(state, &token, retry_body).await?
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     let mut parser = UpstreamParser::new();
     let mut splitter = ToolStreamSplitter::new(canon.known_tool_names());
@@ -334,27 +359,29 @@ fn client_closed() -> GatewayError {
     GatewayError::new(499, "client_closed", "客户端已断开，已中止上游读取")
 }
 
-/// 消息正文：工具约定 + （文件引用 或 内联全文）。
-fn build_instruction(
-    tool_instr: &str,
-    file: Option<&UploadedFile>,
-    inline_mode: bool,
-    doc: &str,
-) -> String {
+/// 消息正文（附件模式）：工具约定 + 文件引用。
+fn build_instruction_with_file(tool_instr: &str, file: &UploadedFile) -> String {
     let mut s = String::new();
     if !tool_instr.is_empty() {
         s.push_str(tool_instr);
         s.push_str("\n\n");
     }
-    if inline_mode || file.is_none() {
-        s.push_str("以下是对话上下文全文，请通读后按文末「下一步」要求直接给出回复：\n\n");
-        s.push_str(doc);
-    } else if let Some(f) = file {
-        s.push_str(&format!(
-            "我已上传对话上下文文件《{}》。该文件包含本次调用的完整对话历史。请通读文件全部内容，然后按文件末尾「下一步」的要求，直接生成对应的助手回复。除该文件外没有其他上下文信息。",
-            f.file_name
-        ));
+    s.push_str(&format!(
+        "我已上传对话上下文文件《{}》。该文件包含本次调用的完整对话历史。请通读文件全部内容，然后按文件末尾「下一步」的要求，直接生成对应的助手回复。除该文件外没有其他上下文信息。",
+        file.file_name
+    ));
+    s
+}
+
+/// 消息正文（内联模式）：工具约定 + 上下文全文。
+fn build_instruction_inline(tool_instr: &str, doc: &str) -> String {
+    let mut s = String::new();
+    if !tool_instr.is_empty() {
+        s.push_str(tool_instr);
+        s.push_str("\n\n");
     }
+    s.push_str("以下是对话上下文全文，请通读后按文末「下一步」要求直接给出回复：\n\n");
+    s.push_str(doc);
     s
 }
 
