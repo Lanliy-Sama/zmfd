@@ -22,8 +22,10 @@ pub struct UpstreamConfig {
     pub assistant_id: String,
     /// 流式端点的 chat_mode，官方对话模式为 chat_agent。
     pub chat_mode: String,
-    /// 默认思考强度：low | high | max
+    /// 默认思考强度：low | high | max（客户端未指定时使用）
     pub default_effort: String,
+    /// 强制思考强度：非空时覆盖客户端请求的 reasoning_effort。
+    pub effort_override: String,
     /// 是否允许上游联网搜索。
     pub is_networking: bool,
     /// 默认上游模型（selected_model）。
@@ -50,6 +52,7 @@ impl UpstreamConfig {
             assistant_id: DEFAULT_ASSISTANT_ID.to_string(),
             chat_mode: "chat_agent".to_string(),
             default_effort: "high".to_string(),
+            effort_override: String::new(),
             is_networking: true,
             selected_model: "glm-5.3".to_string(),
             delete_conversation: true,
@@ -162,6 +165,10 @@ impl Config {
         let e = self.upstream.default_effort.as_str();
         if e != "low" && e != "high" && e != "max" {
             self.upstream.default_effort = "high".to_string();
+        }
+        let eo = self.upstream.effort_override.as_str();
+        if eo != "low" && eo != "high" && eo != "max" {
+            self.upstream.effort_override = String::new();
         }
         if self.upstream.base_url.trim().is_empty() {
             self.upstream.base_url = DEFAULT_BASE_URL.to_string();
