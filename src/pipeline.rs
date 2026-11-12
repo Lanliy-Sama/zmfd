@@ -12,6 +12,7 @@ use crate::tools::{SplitPiece, ToolStreamSplitter};
 use crate::upstream::{self, SseDecoder, UploadedFile, UpstreamParser};
 use crate::util::{estimate_tokens, now_ms, uuid_hex};
 use futures_util::StreamExt;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -141,9 +142,8 @@ async fn pipeline_inner(
 
     // 4. 发起对话流。上游对附件的拒绝有两种形态（都自动降级内联重试一次）：
     //    a) HTTP 400（chat_stream 返回 Err）
-    //    b) HTTP 200 + 流内裸 JSON 业务错误帧（{"status":400,"message":"invalid param"}）
+    //    b) HTTP 200 + 裸 JSON 业务错误帧（对象或数组形态，可能不带换行结尾）
     let mut used_file = uploaded.is_some();
-    let mut retried_in_stream = false;
     let mut resp_slot: Option<reqwest::Response> = {
         let first = upstream::chat_stream(state, &token, body).await;
         match first {
@@ -172,11 +172,6 @@ async fn pipeline_inner(
         }
     };
 
-    let mut parser = UpstreamParser::new();
-    let mut splitter = ToolStreamSplitter::new(canon.known_tool_names());
-    let mut decoder = SseDecoder::new();
-    let mut stream = resp_slot.take().unwrap().bytes_stream();
-
     let idle = Duration::from_secs(cfg.upstream.stream_idle_timeout_secs);
     let deadline = Instant::now() + Duration::from_secs(cfg.upstream.total_timeout_secs);
     let debug = cfg.debug_log;
@@ -191,145 +186,143 @@ async fn pipeline_inner(
     // 流异常结束时的原始帧样本（前 3 行），随错误信息透出便于定位。
     let mut raw_sample: Vec<String> = Vec::new();
 
+    // 5. 统一的行处理循环：先逐块读流，流结束后衔接 decoder.finish() 的残余行
+    //    （上游错误体可能不带换行结尾），所有行走同一套解析 / 重试 / 样本逻辑。
+    let mut parser = UpstreamParser::new();
+    let mut splitter = ToolStreamSplitter::new(canon.known_tool_names());
+    let mut decoder = SseDecoder::new();
+    let mut stream = resp_slot.take().unwrap().bytes_stream();
+    let mut drained: VecDeque<String> = VecDeque::new();
+    let mut stream_done = false;
+
     'outer: loop {
         if Instant::now() > deadline {
             upstream_error = Some(GatewayError::timeout("上游响应超过总时长上限"));
             break 'outer;
         }
-        match tokio::time::timeout(idle, stream.next()).await {
-            Err(_) => {
-                upstream_error = Some(GatewayError::timeout("上游流空闲超时"));
-                break 'outer;
-            }
-            Ok(None) => break 'outer,
-            Ok(Some(Err(e))) => {
-                upstream_error = Some(GatewayError::upstream(format!("上游连接中断: {e}")));
-                break 'outer;
-            }
-            Ok(Some(Ok(bytes))) => {
-                for line in decoder.push(&bytes) {
-                    if raw_sample.len() < 3 {
-                        let t: String = line.chars().take(200).collect();
-                        raw_sample.push(t);
+        let line: String = if !stream_done {
+            match tokio::time::timeout(idle, stream.next()).await {
+                Err(_) => {
+                    upstream_error = Some(GatewayError::timeout("上游流空闲超时"));
+                    break 'outer;
+                }
+                Ok(None) => {
+                    // 流关闭：切换到残余行处理阶段。
+                    stream_done = true;
+                    continue 'outer;
+                }
+                Ok(Some(Err(e))) => {
+                    upstream_error = Some(GatewayError::upstream(format!("上游连接中断: {e}")));
+                    break 'outer;
+                }
+                Ok(Some(Ok(bytes))) => {
+                    let mut lines = decoder.push(&bytes);
+                    if lines.is_empty() {
+                        continue 'outer;
                     }
-                    if debug {
-                        debug_line(&line);
+                    for l in lines.drain(1..) {
+                        drained.push_back(l);
                     }
-                    let Some(ev) = parser.parse_line(&line) else {
-                        continue;
-                    };
-                    if let Some(cid) = ev.conversation_id {
-                        conversation_id = cid;
-                    }
-                    if !ev.reasoning.is_empty() {
-                        full_reasoning.push_str(&ev.reasoning);
-                        if tx
-                            .send(Ok(StreamItem::Reasoning(ev.reasoning.clone())))
-                            .await
-                            .is_err()
-                        {
-                            return Err(client_closed());
-                        }
-                    }
-                    if !ev.text.is_empty() {
-                        full_text.push_str(&ev.text);
-                        for piece in splitter.feed(&ev.text) {
-                            match piece {
-                                SplitPiece::Text(t) => {
-                                    if !t.is_empty()
-                                        && tx.send(Ok(StreamItem::Text(t))).await.is_err()
-                                    {
-                                        return Err(client_closed());
-                                    }
-                                }
-                                SplitPiece::Tool(c) => {
-                                    let call = CanonToolCall {
-                                        id: format!("call_{}", &uuid_hex()[..12]),
-                                        name: c.name,
-                                        arguments: c.arguments_json,
-                                    };
-                                    calls.push(call.clone());
-                                    if tx.send(Ok(StreamItem::ToolCall(call))).await.is_err() {
-                                        return Err(client_closed());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some((ended, reason)) = upstream::status_reason(&ev.status) {
-                        if ended {
-                            if reason == "error" {
-                                if full_text.is_empty() && calls.is_empty() {
-                                    // 流内业务错误且尚未产出内容：若带附件则降级内联重试一次。
-                                    if used_file && !retried_in_stream {
-                                        retried_in_stream = true;
-                                        state.tokens.set_slot_attach(slot, false).await;
-                                        eprintln!(
-                                            "[zmfd] 流内业务错误拒绝附件（status={}），槽位改用内联上下文重试: {}",
-                                            ev.status, ev.error_text
-                                        );
-                                        used_file = false;
-                                        instruction = inline_instruction.clone();
-                                        let retry_body = upstream::build_chat_body(
-                                            &cfg.upstream,
-                                            &instruction,
-                                            None,
-                                            &effort,
-                                            &selected_model,
-                                        );
-                                        resp_slot = Some(
-                                            upstream::chat_stream(state, &token, retry_body).await?,
-                                        );
-                                        stream = resp_slot.take().unwrap().bytes_stream();
-                                        parser = UpstreamParser::new();
-                                        splitter = ToolStreamSplitter::new(canon.known_tool_names());
-                                        decoder = SseDecoder::new();
-                                        continue 'outer;
-                                    }
-                                    let code = ev.error_code.unwrap_or(0);
-                                    upstream_error = Some(GatewayError::upstream(format!(
-                                        "上游返回错误（code={code}）: {}",
-                                        ev.error_text
-                                    )));
-                                } else {
-                                    eprintln!(
-                                        "[zmfd] 上游中途出错，已产出部分内容，按结束交付: {}",
-                                        ev.error_text
-                                    );
-                                    finish_reason = "stop".to_string();
-                                }
-                                got_finish = true;
-                                break 'outer;
-                            }
-                            finish_reason = reason.to_string();
-                            got_finish = true;
-                            // 结束状态后上游可能还有快照帧，继续排空到流关闭或 [DONE]。
-                        }
-                    }
-                    if ev.done {
-                        got_finish = true;
-                        break 'outer;
-                    }
+                    lines.remove(0)
                 }
             }
-        }
-    }
+        } else {
+            match drained.pop_front() {
+                Some(l) => l,
+                None => break 'outer,
+            }
+        };
 
-    // 排空残余（不完整的最后一行）。
-    for line in decoder.finish() {
+        if raw_sample.len() < 3 {
+            let t: String = line.chars().take(200).collect();
+            raw_sample.push(t);
+        }
         if debug {
             debug_line(&line);
         }
-        if let Some(ev) = parser.parse_line(&line) {
-            if let Some(cid) = ev.conversation_id {
-                conversation_id = cid;
+        let Some(ev) = parser.parse_line(&line) else {
+            continue;
+        };
+        if let Some(cid) = ev.conversation_id {
+            conversation_id = cid;
+        }
+        if !ev.reasoning.is_empty() {
+            full_reasoning.push_str(&ev.reasoning);
+            if tx
+                .send(Ok(StreamItem::Reasoning(ev.reasoning.clone())))
+                .await
+                .is_err()
+            {
+                return Err(client_closed());
             }
-            if let Some((ended, reason)) = upstream::status_reason(&ev.status) {
-                if ended && reason != "error" {
-                    finish_reason = reason.to_string();
-                    got_finish = true;
+        }
+        if !ev.text.is_empty() {
+            full_text.push_str(&ev.text);
+            for piece in splitter.feed(&ev.text) {
+                match piece {
+                    SplitPiece::Text(t) => {
+                        if !t.is_empty() && tx.send(Ok(StreamItem::Text(t))).await.is_err() {
+                            return Err(client_closed());
+                        }
+                    }
+                    SplitPiece::Tool(c) => {
+                        let call = CanonToolCall {
+                            id: format!("call_{}", &uuid_hex()[..12]),
+                            name: c.name,
+                            arguments: c.arguments_json,
+                        };
+                        calls.push(call.clone());
+                        if tx.send(Ok(StreamItem::ToolCall(call))).await.is_err() {
+                            return Err(client_closed());
+                        }
+                    }
                 }
             }
+        }
+        if let Some((ended, reason)) = upstream::status_reason(&ev.status) {
+            if ended {
+                if reason == "error" {
+                    if full_text.is_empty() && calls.is_empty() && used_file {
+                        // 流内业务错误且尚未产出内容：附件被拒，降级内联重试一次。
+                        state.tokens.set_slot_attach(slot, false).await;
+                        eprintln!(
+                            "[zmfd] 流内业务错误拒绝附件（status={}），槽位改用内联上下文重试: {}",
+                            ev.status, ev.error_text
+                        );
+                        used_file = false;
+                        instruction = inline_instruction.clone();
+                        let retry_body = upstream::build_chat_body(
+                            &cfg.upstream,
+                            &instruction,
+                            None,
+                            &effort,
+                            &selected_model,
+                        );
+                        resp_slot = Some(upstream::chat_stream(state, &token, retry_body).await?);
+                        stream = resp_slot.take().unwrap().bytes_stream();
+                        parser = UpstreamParser::new();
+                        splitter = ToolStreamSplitter::new(canon.known_tool_names());
+                        decoder = SseDecoder::new();
+                        drained.clear();
+                        stream_done = false;
+                        continue 'outer;
+                    }
+                    let code = ev.error_code.unwrap_or(0);
+                    upstream_error = Some(GatewayError::upstream(format!(
+                        "上游返回错误（code={code}）: {}",
+                        ev.error_text
+                    )));
+                    got_finish = true;
+                    break 'outer;
+                }
+                finish_reason = reason.to_string();
+                got_finish = true;
+                // 结束状态后上游可能还有快照帧，继续排空到流关闭或 [DONE]。
+            }
+        }
+        if ev.done {
+            got_finish = true;
+            break 'outer;
         }
     }
 
@@ -385,7 +378,7 @@ async fn pipeline_inner(
     output_text.push_str(&full_reasoning);
     let usage_out = estimate_tokens(&output_text);
 
-    // 5. 尽力清理上游会话。
+    // 6. 尽力清理上游会话。
     if cfg.upstream.delete_conversation && !conversation_id.is_empty() {
         let st = state.clone();
         let tok = token.clone();
