@@ -1,4 +1,4 @@
-//! 请求管线：规范请求 -> 上传上下文文件 -> 新建上游会话（conversation_id 留空）
+//! 请求管线：规范请求 -> 上传双附件（上下文+工具定义）-> 新建上游会话（conversation_id 留空）
 //! -> 消费 SSE -> 工具块拆分 -> 结构化事件流。
 //!
 //! 每次调用都新建上游对话；得到回复后即结束（下次调用又是全新会话），
@@ -97,9 +97,23 @@ async fn pipeline_inner(
         &canon.tool_choice_kind,
         &canon.tool_choice_name,
     );
+    // 附件模式下的格式约定（仅格式，Schema 在工具定义附件中）。
+    let tool_format_rules = if canon.tools.is_empty() {
+        String::new()
+    } else {
+        crate::tools::format_rules(&canon.tool_choice_kind, &canon.tool_choice_name)
+    };
+    let tools_doc = if canon.tools.is_empty() {
+        String::new()
+    } else {
+        crate::tools::tools_document(&canon.tools)
+    };
     let doc = context::build_context_document(canon, cfg.upstream.max_context_chars);
     let selected_model = cfg.resolve_model(&canon.model);
-    let effort = if canon.effort.is_empty() {
+    // 思考强度优先级：面板强制覆盖 > 客户端显式请求 > 面板默认。
+    let effort = if !cfg.upstream.effort_override.is_empty() {
+        cfg.upstream.effort_override.clone()
+    } else if canon.effort.is_empty() {
         cfg.upstream.default_effort.clone()
     } else {
         canon.effort.clone()
@@ -112,15 +126,38 @@ async fn pipeline_inner(
     let (token, slot, source) = state.tokens.get_access_token(state).await?;
     eprintln!("[zmfd] upstream slot={slot} source={source} model={selected_model} effort={effort}");
 
-    // 3. 上下文投递：优先上传附件；该槽位被上游拒绝过附件或配置为内联时直接内联。
+    // 3. 上下文投递（双附件）：附件 1 = 对话上下文，附件 2 = 工具定义（仅当有工具）。
+    //    槽位被上游拒绝过附件或配置为内联时直接内联（Schema 随文本携带）。
     let can_attach = state.tokens.slot_can_attach(slot).await;
-    let mut uploaded: Option<UploadedFile> = None;
+    let mut uploaded: Vec<UploadedFile> = Vec::new();
     if can_attach && cfg.upstream.context_send_mode != "inline" {
-        let file_name = format!("context-{}.md", now_ms());
-        match upstream::upload_context_file(state, &token, &file_name, doc.clone().into_bytes())
-            .await
+        let ts = now_ms();
+        match upstream::upload_context_file(
+            state,
+            &token,
+            &format!("context-{ts}.md"),
+            doc.clone().into_bytes(),
+        )
+        .await
         {
-            Ok(f) => uploaded = Some(f),
+            Ok(f) => {
+                uploaded.push(f);
+                if !tools_doc.is_empty() {
+                    match upstream::upload_context_file(
+                        state,
+                        &token,
+                        &format!("tools-{ts}.md"),
+                        tools_doc.clone().into_bytes(),
+                    )
+                    .await
+                    {
+                        Ok(f) => uploaded.push(f),
+                        Err(e) => {
+                            eprintln!("[zmfd] 上传工具定义文件失败，Schema 改为内联: {e}");
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("[zmfd] 上传上下文文件失败，改用内联模式: {e}");
             }
@@ -128,14 +165,15 @@ async fn pipeline_inner(
     }
 
     let inline_instruction = build_instruction_inline(&tool_instr, &doc);
-    let mut instruction = match &uploaded {
-        Some(f) => build_instruction_with_file(&tool_instr, f),
-        None => inline_instruction.clone(),
+    let mut instruction = if uploaded.is_empty() {
+        inline_instruction.clone()
+    } else {
+        build_instruction_with_files(&uploaded, &tool_format_rules)
     };
     let body = upstream::build_chat_body(
         &cfg.upstream,
         &instruction,
-        uploaded.as_ref(),
+        &uploaded,
         &effort,
         &selected_model,
     );
@@ -143,7 +181,7 @@ async fn pipeline_inner(
     // 4. 发起对话流。上游对附件的拒绝有两种形态（都自动降级内联重试一次）：
     //    a) HTTP 400（chat_stream 返回 Err）
     //    b) HTTP 200 + 裸 JSON 业务错误帧（对象或数组形态，可能不带换行结尾）
-    let mut used_file = uploaded.is_some();
+    let mut used_file = !uploaded.is_empty();
     let mut resp_slot: Option<reqwest::Response> = {
         let first = upstream::chat_stream(state, &token, body).await;
         match first {
@@ -160,7 +198,7 @@ async fn pipeline_inner(
                     let retry_body = upstream::build_chat_body(
                         &cfg.upstream,
                         &instruction,
-                        None,
+                        &[],
                         &effort,
                         &selected_model,
                     );
@@ -294,7 +332,7 @@ async fn pipeline_inner(
                         let retry_body = upstream::build_chat_body(
                             &cfg.upstream,
                             &instruction,
-                            None,
+                            &[],
                             &effort,
                             &selected_model,
                         );
@@ -399,21 +437,33 @@ fn client_closed() -> GatewayError {
     GatewayError::new(499, "client_closed", "客户端已断开，已中止上游读取")
 }
 
-/// 消息正文（附件模式）：工具约定 + 文件引用。
-fn build_instruction_with_file(tool_instr: &str, file: &UploadedFile) -> String {
+/// 消息正文（附件模式）：工具调用格式约定 + 附件清单与阅读顺序引导。
+/// files[0] = 对话上下文，files[1]（如存在）= 工具定义。
+fn build_instruction_with_files(files: &[UploadedFile], tool_format_rules: &str) -> String {
     let mut s = String::new();
-    if !tool_instr.is_empty() {
-        s.push_str(tool_instr);
+    if !tool_format_rules.is_empty() {
+        s.push_str(tool_format_rules);
         s.push_str("\n\n");
     }
     s.push_str(&format!(
-        "我已上传对话上下文文件《{}》。该文件包含本次调用的完整对话历史。请通读文件全部内容，然后按文件末尾「下一步」的要求，直接生成对应的助手回复。除该文件外没有其他上下文信息。",
-        file.file_name
+        "本次请求共附带 {} 个文件，请按以下顺序通读：\n",
+        files.len()
     ));
+    for (i, f) in files.iter().enumerate() {
+        let desc = if i == 0 {
+            "对话上下文：本次调用的完整对话历史，文末「下一步」为当前任务"
+        } else {
+            "可用工具定义：所有可用工具的名称、说明与入参 Schema"
+        };
+        s.push_str(&format!("{}. 《{}》—— {}\n", i + 1, f.file_name, desc));
+    }
+    s.push_str(
+        "\n阅读顺序：先通读第 1 个文件明确当前任务；再查阅第 2 个文件（如存在）了解可用工具及各工具的入参 Schema；然后决定直接作答，或按上述约定输出工具调用块。\n除这些文件外没有其他上下文信息。\n",
+    );
     s
 }
 
-/// 消息正文（内联模式）：工具约定 + 上下文全文。
+/// 消息正文（内联模式）：工具约定（含 Schema 清单）+ 上下文全文。
 fn build_instruction_inline(tool_instr: &str, doc: &str) -> String {
     let mut s = String::new();
     if !tool_instr.is_empty() {
