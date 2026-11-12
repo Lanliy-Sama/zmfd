@@ -12,20 +12,20 @@
 ## 工作方式
 
 1. 每次网关调用都会**新建一次上游对话**（`conversation_id` 留空，由上游自动建会话）；
-2. 客户端传入的完整多轮上下文（含工具调用与工具结果）序列化为 Markdown，**以附件形式上传**（`POST /chatglm/productivity-api/file/chat_upload`）。有工具时上传**两个附件**：附件 1 = 对话上下文（先读），附件 2 = 可用工具定义（后读）；消息正文只携带引导提示词（说明两个文件的内容、阅读顺序与工具调用回复格式）。上游拒绝附件或上传失败时自动改用内联文本（按槽位记忆能力，不重复尝试）；
-3. 上游是 agentmore 的 `agent-api/chat/stream`（`chat_mode=chat_agent`，无沙箱，不需要上游 Read 工具读取附件）；
+2. 客户端传入的完整多轮上下文（含工具调用与工具结果）序列化为 Markdown **附件 1**；客户端声明的全部工具定义序列化为 Markdown **附件 2**；两附件以 `POST /chatglm/productivity-api/file/chat_upload` 上传，消息正文只携带引导提示词（两附件说明、阅读顺序、工具调用回复格式）。上游拒绝附件或上传失败时自动改用内联文本（按槽位记忆能力，不重复尝试）；
+3. 上游是 agentmore 的 `agent-api/chat/stream`（`chat_mode=chat_agent`，无沙箱，模型直接读附件）；
 4. 收到回复后本次会话即结束（可选自动删除上游会话），**下一次调用又是全新会话**；
 5. 上游并发由信号量限制，**最高 3**（面板可调 1~3），超限排队而非报错。
 
 ### 工具调用桥
 
-上游没有结构化工具调用通道，网关通过提示词约定让模型用文本输出调用块：
+工具定义（名称/说明/Schema）随附件 2 提供给模型；网关约定模型用文本输出调用块：
 
 ```
 <tool>{"name": "<工具名>", "arguments": { ... }}</tool>
 ```
 
-工具定义（名称/说明/Schema）随附件 2 提供给模型；网关流式解析模型输出的调用块并还原为协议原生的 `tool_calls`（OpenAI）/ `function_call`（Responses）/ `tool_use`（Anthropic）；客户端回传的工具结果会在下一次调用的上下文附件中渲染为 `[tool 结果]` 段落，形成多轮工具循环。工具名支持精确 / 忽略大小写 / 相似度 ≥ 0.72 的模糊匹配。
+网关流式解析调用块并还原为协议原生的 `tool_calls`（OpenAI）/ `function_call`（Responses）/ `tool_use`（Anthropic）；客户端回传的工具结果在下一次调用的上下文附件中渲染为 `[tool 结果]` 段落，形成多轮工具循环。工具名支持精确 / 忽略大小写 / 相似度 ≥ 0.72 的模糊匹配。
 
 ## 运行
 
@@ -40,17 +40,15 @@ agentmore2api.exe --host 127.0.0.1 --port 8795 --config config.json
 
 ## 配置账号
 
-两种方式（面板「账号凭据」页可在线维护）：
-
 1. **refresh_token（推荐）**：浏览器登录 agentmore.chatglm.cn 后，DevTools → Application → Cookies → 复制 `chatglm_refresh_token`，粘贴进面板账号列表。令牌轮换会自动写回配置文件；支持多账号轮转。
-2. **游客回退**：不配置账号时自动走 `POST /chatglm/user-api/guest/access` 免登录令牌（配置 `guest_fallback: true`，默认开启）。
+2. **游客回退**：不配置账号时自动走 `POST /chatglm/user-api/guest/access` 免登录令牌（默认开启）。
 
-> **实测结论（2026-11-11/13，基于官方前端逆向 + 真实探针 + 本地网关实测）**：
-> - 对话模式会话 URL 形如 `/chat/general/<会话id>`（`general` = 普通对话）；URL 中不含 agent_id，`assistant_id` 内置默认值已实测可用。
-> - 游客令牌能通过签名鉴权，但**没有对话积分**——流式请求会被上游以 `status:-1001「剩余积分不足」` 拒绝。真实对话必须导入带积分的账号 refresh_token。
-> - 文件附件已被网关真实账号实测打通：正确的附件块形态为 `{"type":"file","file":[{file_id,file_name,file_url,file_size,url,cover_images,order,width,height}]}`（`file` 为数组，元素需带全部字段，来自官方 Che 函数）。
+> **实测结论（2026-11-11/13，官方前端逆向 + 真实探针 + 本地网关实测）**：
+> - 对话模式会话 URL 形如 `/chat/general/<会话id>`；`assistant_id` 内置默认值已实测可用。
+> - 游客令牌能鉴权但**没有对话积分**（-1001），真实对话必须导入账号 refresh_token。
+> - 文件附件已被网关真实账号实测打通：正确形态为 `{"type":"file","file":[{file_id,file_name,file_url,file_size,url,cover_images,order,width,height}]}`（`file` 为数组，元素需带全部字段，来自官方 Che 函数）。
 > - 内容帧语义（实测）：`part.status=="init"` 为增量（追加），`part.status=="finish"` 为累积全量快照（替换），帧级 `meta_data` 显式标志优先；错误体可能为裸 JSON 对象/数组行且不带换行结尾。
-> - `available_models` 接口：游客默认 glm-5.3-flash，思考档位 low/high/max。
+> - `available_models`：游客默认 glm-5.3-flash，思考档位 low/high/max。
 
 X-Sign 签名密钥是官方网页端 JS 中的公开协议指纹常量，已内置默认值，可在面板覆盖。
 
