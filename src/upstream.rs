@@ -380,11 +380,11 @@ impl UpstreamParser {
         if line.is_empty() {
             return None;
         }
-        // 正常 SSE 帧带 "data:" 前缀；业务错误帧（如 -1001 积分不足、400 invalid param）
-        // 是 HTTP 200 内的裸 JSON 行，不带前缀，两种都要接受。
+        // 接受三种形态：SSE "data:" 帧、HTTP 200 内裸 JSON 对象行、
+        // 以及数组形态错误体（实测附件被拒时为 [{"status":400,...}]，取首个对象元素）。
         let payload = if let Some(rest) = line.strip_prefix("data:") {
             rest.trim()
-        } else if line.starts_with('{') {
+        } else if line.starts_with('{') || line.starts_with('[') {
             line
         } else {
             return None;
@@ -397,9 +397,18 @@ impl UpstreamParser {
             ev.done = true;
             return Some(ev);
         }
-        let obj: Value = match serde_json::from_str(payload) {
-            Ok(v) => v,
-            Err(_) => return None,
+        let obj: Value = {
+            let parsed: Value = match serde_json::from_str(payload) {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            match parsed {
+                Value::Array(items) => match items.into_iter().find(|v| v.is_object()) {
+                    Some(v) => v,
+                    None => return None,
+                },
+                other => other,
+            }
         };
 
         let mut ev = UpParsed::empty();
