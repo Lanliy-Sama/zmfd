@@ -59,7 +59,7 @@ pub async fn api_config_put(
             )));
         }
     };
-    match state.apply_config(incoming) {
+    match state.apply_config(incoming).await {
         Ok(()) => axum::Json(json!({"ok": true})).into_response(),
         Err(e) => panel_json_error(GatewayError::new(400, "invalid_request", e)),
     }

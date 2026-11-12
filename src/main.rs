@@ -89,6 +89,9 @@ async fn async_main(host_override: Option<String>, port_override: Option<u16>, c
     let addr_host = cfg.host.clone();
     let addr_port = cfg.port;
     let state = Arc::new(AppState::new(cfg, cfg_path));
+    // 启动时把配置里的账号载入令牌池（此前只在面板保存时同步，
+    // 导致重启后账号池为空、永远走游客，这是多轮排障的根因）。
+    state.tokens.sync_accounts(&state.config().accounts).await;
 
     let app = Router::new()
         .route("/", get(panel_index))

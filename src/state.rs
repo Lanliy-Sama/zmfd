@@ -54,7 +54,7 @@ impl AppState {
     }
 
     /// 保存配置并让可热更的组件生效（并发闸门 / HTTP 客户端 / 账号池）。
-    pub fn apply_config(&self, mut cfg: Config) -> Result<(), String> {
+    pub async fn apply_config(&self, mut cfg: Config) -> Result<(), String> {
         cfg.normalize();
         let old = self.config();
         // 面板提交的配置不含 device_id，保留现有设备指纹避免漂移。
@@ -77,7 +77,7 @@ impl AppState {
         if proxy_changed {
             *self.http.write().expect("http lock poisoned") = build_http_client(&cfg);
         }
-        self.tokens.sync_accounts(&cfg.accounts);
+        self.tokens.sync_accounts(&cfg.accounts).await;
         Ok(())
     }
 
