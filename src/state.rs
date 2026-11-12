@@ -64,11 +64,13 @@ impl AppState {
         let concurrency_changed = old.max_concurrency != cfg.max_concurrency;
         let proxy_changed = old.proxy != cfg.proxy;
 
+        // 先落盘再改内存：写盘失败时不污染运行时配置（避免「内存已生效、
+        // 磁盘还是旧值」的漂移）。
+        cfg.save_to(&self.cfg_path)?;
         {
             let mut w = self.config.write().expect("config lock poisoned");
             *w = cfg.clone();
         }
-        cfg.save_to(&self.cfg_path)?;
 
         if concurrency_changed {
             *self.semaphore.write().expect("semaphore lock poisoned") =

@@ -1,7 +1,7 @@
 [package]
 # agentmore.chatglm.cn 对话模式反向网关
 name = "agentmore2api"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2021"
 description = "agentmore.chatglm.cn (chat mode) reverse gateway: OpenAI Chat Completions / OpenAI Responses / Anthropic Messages"
 license = "MIT"
