@@ -199,7 +199,7 @@ pub async fn upload_context_file(
     })
 }
 
-/// 构造对话模式流式请求体（与官方 ChatList 构造一致的字段集）。
+/// 构造对话模式流式请求体（与官方 ChatList 的 Che 函数构造一致的字段集）。
 pub fn build_chat_body(
     cfg: &UpstreamConfig,
     instruction: &str,
@@ -209,15 +209,22 @@ pub fn build_chat_body(
 ) -> Value {
     let mut content = vec![json!({"type": "text", "text": instruction})];
     if let Some(f) = file {
+        // 附件块形态实测（官方前端 Che 函数）：file 是数组，元素带
+        // url / cover_images / order / width / height 字段，缺任何一个都会
+        // 被上游以 {"status":400,"message":"invalid param"} 拒绝。
         content.push(json!({
             "type": "file",
-            "file": {
-                "file_type": f.file_type,
+            "file": [{
                 "file_id": f.file_id,
                 "file_name": f.file_name,
                 "file_url": f.file_url,
                 "file_size": f.file_size,
-            }
+                "url": f.file_url,
+                "cover_images": Value::Null,
+                "order": 0,
+                "width": 0,
+                "height": 0,
+            }]
         }));
     }
     json!({
