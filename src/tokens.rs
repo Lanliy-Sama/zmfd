@@ -24,6 +24,8 @@ pub struct Account {
     pub checked_at: u64,
     /// account = 用户导入的 refresh_token；guest = 游客令牌。
     pub source: &'static str,
+    /// 该槽位是否可在流式请求中携带文件附件（上游 400 拒绝后降级为 false）。
+    pub can_attach: bool,
 }
 
 struct Inner {
@@ -64,6 +66,7 @@ impl TokenManager {
                     health: "unknown".to_string(),
                     checked_at: 0,
                     source: "account",
+                    can_attach: true,
                 });
             }
         }
@@ -194,6 +197,7 @@ impl TokenManager {
                     "token_masked": mask_token(&a.refresh_token),
                     "cached": !a.access_token.is_empty() && a.expires_at > now,
                     "checked_at": a.checked_at,
+                    "can_attach": a.can_attach,
                 })
             })
             .collect()
@@ -201,6 +205,25 @@ impl TokenManager {
 
     pub async fn account_count(&self) -> usize {
         self.inner.lock().await.accounts.len()
+    }
+
+    /// 指定槽位当前是否允许携带文件附件。
+    pub async fn slot_can_attach(&self, slot: usize) -> bool {
+        self.inner
+            .lock()
+            .await
+            .accounts
+            .get(slot)
+            .map(|a| a.can_attach)
+            .unwrap_or(false)
+    }
+
+    /// 上游拒绝附件后把槽位降级为内联模式。
+    pub async fn set_slot_attach(&self, slot: usize, can: bool) {
+        let mut inner = self.inner.lock().await;
+        if let Some(a) = inner.accounts.get_mut(slot) {
+            a.can_attach = can;
+        }
     }
 }
 
@@ -288,6 +311,8 @@ async fn ensure_guest_slot(state: &AppState, inner: &mut Inner) -> Result<usize,
             health: "healthy".to_string(),
             checked_at: now_ms(),
             source: "guest",
+            // 游客实测：流式请求携带文件附件会被上游以 HTTP 400 拒绝，直接走内联。
+            can_attach: false,
         });
         Ok(inner.accounts.len() - 1)
     }
