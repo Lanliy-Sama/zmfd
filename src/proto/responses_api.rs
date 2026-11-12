@@ -52,15 +52,18 @@ pub fn parse(body: &Value, cfg: &Config) -> Result<CanonRequest, GatewayError> {
                 let itype = item.get("type").and_then(Value::as_str).unwrap_or("message");
                 match itype {
                     "message" => {
-                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        // 角色归一化（trim + 小写）。
+                        let role = item
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .unwrap_or("user")
+                            .trim()
+                            .to_lowercase();
                         let content = item.get("content");
-                        match role {
+                        match role.as_str() {
                             "user" | "system" | "developer" => {
                                 let text = content_to_text(content)?;
-                                let r = match role {
-                                    "user" => Role::User,
-                                    _ => Role::System,
-                                };
+                                let r = if role == "user" { Role::User } else { Role::System };
                                 canon.messages.push(CanonMessage::simple(r, text));
                             }
                             "assistant" => {
@@ -119,8 +122,10 @@ pub fn parse(body: &Value, cfg: &Config) -> Result<CanonRequest, GatewayError> {
         }
     }
 
-    if canon.messages.iter().all(|m| m.role != Role::User) {
-        return Err(GatewayError::bad_request("input 中缺少用户消息"));
+    // 只要求历史非空：工具续跑请求可能只有 function_call + function_call_output
+    // （没有新的 user 消息），同样合法。上下文文档对 [tool 结果] 结尾已有处理。
+    if canon.messages.is_empty() {
+        return Err(GatewayError::bad_request("input 中没有可用消息"));
     }
 
     // Responses API 的 tools 是平铺形态：{type:"function", name, description, parameters}。
