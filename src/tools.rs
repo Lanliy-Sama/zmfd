@@ -40,6 +40,7 @@ pub fn instructions(tools: &[ToolDef], bias_kind: &str, bias_name: &str) -> Stri
     lines.join("\n")
 }
 
+/// 内联模式的格式约定行（Schema 随文本携带，不指代外部文件）。
 fn format_rules_lines(bias_kind: &str, bias_name: &str) -> Vec<String> {
     let mut lines: Vec<String> = vec![
         "[TOOL USE INSTRUCTIONS]".to_string(),
@@ -69,7 +70,26 @@ pub fn format_rules(bias_kind: &str, bias_name: &str) -> String {
     if bias_kind == "none" {
         return String::new();
     }
-    format_rules_lines(bias_kind, bias_name).join("\n")
+    let mut lines: Vec<String> = vec![
+        "[TOOL USE INSTRUCTIONS]".to_string(),
+        "你可以调用工具。当且仅当需要调用工具时，你的回复中输出如下格式的调用块（可多个，每个一块）：".to_string(),
+        String::new(),
+        format!("{TOOL_BLOCK_OPEN}{{\"name\": \"<工具名>\", \"arguments\": {{ ... }}}}{TOOL_BLOCK_CLOSE}"),
+        String::new(),
+        "规则：".to_string(),
+        "1. 只有确实要调用工具时才输出调用块；不需要调用工具时正常作答，不要提及本约定。".to_string(),
+        "2. arguments 必须是合法 JSON 对象，并符合「工具定义」文件中对应工具的入参 Schema。".to_string(),
+        "3. 不要把调用块包在代码块或其他标记里。".to_string(),
+    ];
+    match bias_kind {
+        "required" => lines.push("4. 本次要求必须调用一个工具，不要直接给出普通回答。".to_string()),
+        "named" => lines.push(format!(
+            "4. 本次必须调用名为「{bias_name}」的工具，不要直接给出普通回答。"
+        )),
+        _ => {}
+    }
+    lines.push("[/TOOL USE INSTRUCTIONS]".to_string());
+    lines.join("\n")
 }
 
 /// 工具定义文档（上传为附件 2）：名称、说明与入参 Schema。
@@ -191,11 +211,13 @@ impl ToolStreamSplitter {
                 out.push(SplitPiece::Text(std::mem::take(&mut self.buffer)));
             }
         } else {
-            // 无完整块且无块开头时，保留可能是块前缀的尾部（最长 "<tool_call" 10 字符）。
-            let tags = [TOOL_BLOCK_OPEN, TOOL_CALL_OPEN, TOOL_BLOCK_CLOSE];
+            // 无完整块时，保留可能是任一标签前缀的尾部（含 </tool_call>），
+            // 否则闭标签被分片截断时整个已缓冲的块会作为正文泄漏、调用丢失。
+            let tags = [TOOL_BLOCK_OPEN, TOOL_CALL_OPEN, TOOL_BLOCK_CLOSE, TOOL_CALL_CLOSE];
+            let max_tag = tags.iter().map(|t| t.len()).max().unwrap_or(0);
             let mut hold = 0usize;
             let chars: Vec<char> = self.buffer.chars().collect();
-            for k in 1..=10usize {
+            for k in 1..=max_tag {
                 if k > chars.len() {
                     break;
                 }
@@ -425,7 +447,7 @@ mod tests {
         let all: Vec<SplitPiece> = [a, b, c].concat();
         for piece in &all {
             if let SplitPiece::Text(t) = piece {
-                assert!(!t.contains("<tool>"), "开标签泄漏为正文: {t:}");
+                assert!(!t.contains("<tool>"), "开标签泄漏为正文: {t:?}");
             }
         }
         let text: String = all
@@ -433,6 +455,28 @@ mod tests {
             .filter_map(|p| if let SplitPiece::Text(t) = p { Some(t.clone()) } else { None })
             .collect();
         assert_eq!(text, "abcxyz");
+        let tools = all.iter().filter(|p| matches!(p, SplitPiece::Tool(_))).count();
+        assert_eq!(tools, 1);
+    }
+
+    #[test]
+    fn splitter_holds_split_close_tag_of_tool_call() {
+        // 闭标签 </tool_call> 被分片截断：已缓冲的整块不得作为正文泄漏。
+        let mut sp = ToolStreamSplitter::new(vec!["f".to_string()]);
+        let a = sp.feed("<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_c");
+        let b = sp.feed("all>xyz");
+        let c = sp.flush();
+        let all: Vec<SplitPiece> = [a, b, c].concat();
+        for piece in &all {
+            if let SplitPiece::Text(t) = piece {
+                assert!(!t.contains("<tool_call"), "块体泄漏为正文: {t:?}");
+            }
+        }
+        let text: String = all
+            .iter()
+            .filter_map(|p| if let SplitPiece::Text(t) = p { Some(t.clone()) } else { None })
+            .collect();
+        assert_eq!(text, "xyz");
         let tools = all.iter().filter(|p| matches!(p, SplitPiece::Tool(_))).count();
         assert_eq!(tools, 1);
     }
