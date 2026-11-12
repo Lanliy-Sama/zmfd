@@ -375,10 +375,18 @@ impl UpstreamParser {
 
     pub fn parse_line(&mut self, line: &str) -> Option<UpParsed> {
         let line = line.trim();
-        if !line.starts_with("data:") {
+        if line.is_empty() {
             return None;
         }
-        let payload = line[5..].trim();
+        // 正常 SSE 帧带 "data:" 前缀；业务错误帧（如 -1001 积分不足）是
+        // HTTP 200 内的裸 JSON 行，不带前缀，两种都要接受。
+        let payload = if let Some(rest) = line.strip_prefix("data:") {
+            rest.trim()
+        } else if line.starts_with('{') {
+            line
+        } else {
+            return None;
+        };
         if payload.is_empty() {
             return None;
         }
@@ -425,6 +433,18 @@ impl UpstreamParser {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        if ev.status.is_empty() {
+            // status 可能是数字（如 -1001 积分不足）：负数即业务错误帧。
+            if let Some(n) = obj.get("status").and_then(Value::as_i64) {
+                ev.status = n.to_string();
+                if n < 0 {
+                    if let Some(t) = str_field(&obj, "message") {
+                        ev.error_text = t;
+                    }
+                    ev.error_code = Some(n);
+                }
+            }
+        }
 
         // 增量语义判定。
         let meta = obj.get("meta_data");
@@ -589,11 +609,19 @@ fn json_truthy(v: &Value) -> bool {
 }
 
 /// 结束状态判定：(是否结束, finish_reason)。None 表示尚未结束。
+/// 负数业务状态码（如 -1001 积分不足）按错误结束处理。
 pub fn status_reason(status: &str) -> Option<(bool, &'static str)> {
     match status {
         "finish" | "stop" => Some((true, "stop")),
         "intervene" => Some((true, "content_filter")),
         "error" => Some((true, "error")),
-        _ => None,
+        _ => {
+            if let Ok(n) = status.parse::<i64>() {
+                if n < 0 {
+                    return Some((true, "error"));
+                }
+            }
+            None
+        }
     }
 }
