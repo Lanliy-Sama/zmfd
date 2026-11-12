@@ -31,13 +31,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install Cranelift codegen backend
+        run: rustup component add rustc-codegen-cranelift-preview
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release
+      - name: Build release (Cranelift backend, opt-level Speed)
+        env:
+          RUSTFLAGS: "-Zcodegen-backend=cranelift"
         run: cargo build --release
 
       - name: Package (Linux)
@@ -85,7 +90,7 @@ jobs:
           files: dist/*
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('auto-{0}', github.run_number) }}
           body: |
-            agentmore2api 自动构建产物。
+            agentmore2api 自动构建产物（Cranelift 后端，opt-level Speed）。
             - linux: agentmore2api-linux-x64.tar.gz
             - windows: agentmore2api-windows-x64.zip
           generate_release_notes: true

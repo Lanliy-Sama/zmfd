@@ -23,6 +23,8 @@ uuid = { version = "1", features = ["v4"] }
 md-5 = "0.10"
 
 [profile.release]
-opt-level = 2
+# opt-level 3：最高速度优化档（Cranelift 后端映射为其 OptLevel::Speed）
+opt-level = 3
+# LTO 是 LLVM 专属优化；Cranelift 后端下必须保持关闭
 lto = false
 strip = true
