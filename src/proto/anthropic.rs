@@ -62,9 +62,13 @@ pub fn parse(body: &Value, cfg: &Config) -> Result<CanonRequest, GatewayError> {
         return Err(GatewayError::bad_request("messages 不能为空"));
     }
     for msg in messages {
-        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
-        match role {
-            "user" => {
+        // 角色归一化（trim + 小写），容忍 system/developer/tool 等变体：
+        // 官方协议 system 在顶层，但部分客户端会把 system 角色放进 messages。
+        let role_raw = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        let role = role_raw.trim().to_lowercase();
+        match role.as_str() {
+            "user" | "system" | "developer" => {
+                let canon_role = if role == "user" { Role::User } else { Role::System };
                 let mut text_buf = String::new();
                 match msg.get("content") {
                     Some(Value::String(s)) => text_buf.push_str(s),
@@ -99,9 +103,7 @@ pub fn parse(body: &Value, cfg: &Config) -> Result<CanonRequest, GatewayError> {
                     _ => {}
                 }
                 if !text_buf.is_empty() {
-                    canon
-                        .messages
-                        .push(CanonMessage::simple(Role::User, text_buf));
+                    canon.messages.push(CanonMessage::simple(canon_role, text_buf));
                 }
             }
             "assistant" => {
@@ -145,6 +147,19 @@ pub fn parse(body: &Value, cfg: &Config) -> Result<CanonRequest, GatewayError> {
                     _ => {}
                 }
                 m.content = text_buf;
+                canon.messages.push(m);
+            }
+            "tool" | "function" => {
+                // 容忍 tool 角色消息：视为工具结果文本。
+                let mut m = CanonMessage::simple(
+                    Role::Tool,
+                    content_to_text(msg.get("content")).unwrap_or_default(),
+                );
+                m.tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 canon.messages.push(m);
             }
             other => {
@@ -393,8 +408,14 @@ async fn stream_task(
         match item {
             Ok(StreamItem::Reasoning(t)) => {
                 if current != Block::Thinking {
+                    // 关闭旧块后索引前移：客户端按 index 聚合内容块，
+                    // 复用已关闭块的 index 会导致新旧块互相覆盖。
+                    let had_open = current != Block::None;
                     if !close_block(&out, &mut current, index).await {
                         break;
+                    }
+                    if had_open {
+                        index += 1;
                     }
                     let start = json!({
                         "type": "content_block_start",
@@ -417,8 +438,12 @@ async fn stream_task(
             }
             Ok(StreamItem::Text(t)) => {
                 if current != Block::Text {
+                    let had_open = current != Block::None;
                     if !close_block(&out, &mut current, index).await {
                         break;
+                    }
+                    if had_open {
+                        index += 1;
                     }
                     let start = json!({
                         "type": "content_block_start",
@@ -440,8 +465,12 @@ async fn stream_task(
                 }
             }
             Ok(StreamItem::ToolCall(c)) => {
+                let had_open = current != Block::None;
                 if !close_block(&out, &mut current, index).await {
                     break;
+                }
+                if had_open {
+                    index += 1;
                 }
                 let start = json!({
                     "type": "content_block_start",
