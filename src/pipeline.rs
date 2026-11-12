@@ -130,6 +130,7 @@ async fn pipeline_inner(
     //    槽位被上游拒绝过附件或配置为内联时直接内联（Schema 随文本携带）。
     let can_attach = state.tokens.slot_can_attach(slot).await;
     let mut uploaded: Vec<UploadedFile> = Vec::new();
+    let mut tools_doc_attached = false;
     if can_attach && cfg.upstream.context_send_mode != "inline" {
         let ts = now_ms();
         match upstream::upload_context_file(
@@ -151,11 +152,16 @@ async fn pipeline_inner(
                     )
                     .await
                     {
-                        Ok(f) => uploaded.push(f),
+                        Ok(f) => {
+                            uploaded.push(f);
+                            tools_doc_attached = true;
+                        }
                         Err(e) => {
-                            eprintln!("[zmfd] 上传工具定义文件失败，Schema 改为内联: {e}");
+                            eprintln!("[zmfd] 上传工具定义文件失败，Schema 改为正文内联: {e}");
                         }
                     }
+                } else {
+                    tools_doc_attached = true;
                 }
             }
             Err(e) => {
@@ -167,8 +173,14 @@ async fn pipeline_inner(
     let inline_instruction = build_instruction_inline(&tool_instr, &doc);
     let mut instruction = if uploaded.is_empty() {
         inline_instruction.clone()
-    } else {
+    } else if tools_doc_attached {
         build_instruction_with_files(&uploaded, &tool_format_rules)
+    } else {
+        // 工具定义附件上传失败：Schema 退回正文内联（完整指令段），上下文仍走附件。
+        let mut s = tool_instr.clone();
+        s.push_str("\n\n");
+        s.push_str(&build_instruction_with_files(&uploaded, ""));
+        s
     };
     let body = upstream::build_chat_body(
         &cfg.upstream,
@@ -245,7 +257,12 @@ async fn pipeline_inner(
                     break 'outer;
                 }
                 Ok(None) => {
-                    // 流关闭：切换到残余行处理阶段。
+                    // 流关闭：先把 decoder 里残余的无换行尾巴并入待处理队列
+                    // （上游错误体常不带换行结尾，漏掉会导致「未收到完成标记」
+                    // 且错误帧整体丢失），再切换到残余行处理阶段。
+                    for l in decoder.finish() {
+                        drained.push_back(l);
+                    }
                     stream_done = true;
                     continue 'outer;
                 }
