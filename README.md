@@ -12,20 +12,20 @@
 ## 工作方式
 
 1. 每次网关调用都会**新建一次上游对话**（`conversation_id` 留空，由上游自动建会话）；
-2. 客户端传入的完整多轮上下文（含工具调用与工具结果）序列化为 Markdown **附件 1**；客户端声明的全部工具定义序列化为 Markdown **附件 2**；两附件以 `POST /chatglm/productivity-api/file/chat_upload` 上传，消息正文只携带引导提示词（两附件说明、阅读顺序、工具调用回复格式）。上游拒绝附件或上传失败时自动改用内联文本（按槽位记忆能力，不重复尝试）；
-3. 上游是 agentmore 的 `agent-api/chat/stream`（`chat_mode=chat_agent`，无沙箱，模型直接读附件）；
+2. 客户端传入的完整多轮上下文（含工具调用与工具结果）序列化为 Markdown，**以附件形式上传**（`POST /chatglm/productivity-api/file/chat_upload`）。有工具时上传**两个附件**：附件 1 = 对话上下文（先读），附件 2 = 可用工具定义（后读）；消息正文只携带引导提示词（说明两个文件的内容、阅读顺序与工具调用回复格式）。上游拒绝附件或上传失败时自动改用内联文本（按槽位记忆能力，不重复尝试）；
+3. 上游是 agentmore 的 `agent-api/chat/stream`（`chat_mode=chat_agent`，无沙箱，不需要上游 Read 工具读取附件）；
 4. 收到回复后本次会话即结束（可选自动删除上游会话），**下一次调用又是全新会话**；
 5. 上游并发由信号量限制，**最高 3**（面板可调 1~3），超限排队而非报错。
 
 ### 工具调用桥
 
-工具定义（名称/说明/Schema）随附件 2 提供给模型；网关约定模型用文本输出调用块：
+上游没有结构化工具调用通道，网关通过提示词约定让模型用文本输出调用块：
 
 ```
 <tool>{"name": "<工具名>", "arguments": { ... }}</tool>
 ```
 
-网关流式解析调用块并还原为协议原生的 `tool_calls`（OpenAI）/ `function_call`（Responses）/ `tool_use`（Anthropic）；客户端回传的工具结果在下一次调用的上下文附件中渲染为 `[tool 结果]` 段落，形成多轮工具循环。工具名支持精确 / 忽略大小写 / 相似度 ≥ 0.72 的模糊匹配。
+网关流式解析这些块并还原为协议原生的 `tool_calls`（OpenAI）/ `function_call`（Responses）/ `tool_use`（Anthropic）；客户端回传的工具结果会在下一次调用的上下文文件中渲染为 `[tool 结果]` 段落，形成多轮工具循环。工具名支持精确 / 忽略大小写 / 相似度 ≥ 0.72 的模糊匹配。
 
 ## 运行
 
@@ -40,15 +40,21 @@ agentmore2api.exe --host 127.0.0.1 --port 8795 --config config.json
 
 ## 配置账号
 
-1. **refresh_token（推荐）**：浏览器登录 agentmore.chatglm.cn 后，DevTools → Application → Cookies → 复制 `chatglm_refresh_token`，粘贴进面板账号列表。令牌轮换会自动写回配置文件；支持多账号轮转。
-2. **游客回退**：不配置账号时自动走 `POST /chatglm/user-api/guest/access` 免登录令牌（默认开启）。
+两种方式（面板「账号凭据」页可在线维护）：
 
-> **实测结论（2026-11-11/13，官方前端逆向 + 真实探针 + 本地网关实测）**：
-> - 对话模式会话 URL 形如 `/chat/general/<会话id>`；`assistant_id` 内置默认值已实测可用。
-> - 游客令牌能鉴权但**没有对话积分**（-1001），真实对话必须导入账号 refresh_token。
-> - 文件附件已被网关真实账号实测打通：正确形态为 `{"type":"file","file":[{file_id,file_name,file_url,file_size,url,cover_images,order,width,height}]}`（`file` 为数组，元素需带全部字段，来自官方 Che 函数）。
-> - 内容帧语义（实测）：`part.status=="init"` 为增量（追加），`part.status=="finish"` 为累积全量快照（替换），帧级 `meta_data` 显式标志优先；错误体可能为裸 JSON 对象/数组行且不带换行结尾。
-> - `available_models`：游客默认 glm-5.3-flash，思考档位 low/high/max。
+1. **refresh_token（推荐）**：浏览器登录 agentmore.chatglm.cn 后，DevTools → Application → Cookies → 复制 `chatglm_refresh_token`，粘贴进面板账号列表。令牌轮换会自动写回配置文件；支持多账号轮转。
+2. **游客回退**：不配置账号时自动走 `POST /chatglm/user-api/guest/access` 免登录令牌（配置 `guest_fallback: true`，默认开启）。
+
+> **实测结论（2026-11-11，基于官方前端逆向 + 真实探针）**：
+> - 对话模式会话 URL 形如 `/chat/general/<会话id>`（`general` = 普通对话，区别于 claw 智能体的 `agent` 类型）；URL 中不含 agent_id，消息体使用的 `assistant_id` 内置默认值已实测可用。
+> - 游客令牌能通过签名鉴权（令牌/上传接口均 200），但**没有对话积分**——流式请求会被上游以 `status:-1001「剩余积分不足」` 拒绝，无法实际对话。真实对话必须导入带积分的账号 refresh_token。
+> - 游客身份的流式请求**不允许携带文件附件**（HTTP 400），网关会自动降级为内联文本；账号槽位若也被上游拒绝附件，会记忆该能力并自动切换内联。
+> - 上游错误帧有两种形态：SSE `data:` 帧与 HTTP 200 内的裸 JSON 行（如 -1001），网关两者都能解析并转成明确错误信息。
+> - `available_models` 接口确认：游客默认模型 `glm-5.3-flash`，思考档位 `low/high/max`。
+> - **文件附件实测（2026-11-13）**：无论游客还是登录账号，流式请求携带 `{type:"file"}` 块都会被上游拒绝（HTTP 400 数组体，或 HTTP 200 + 裸 JSON `{"status":400,"message":"invalid param"}`）。网关对两种形态都会自动降级为内联文本并按槽位记忆，不再重复尝试。上下文内容不受影响（内联全文与附件等价）。
+> - **内容帧语义实测**：`agent-api/chat/stream` 的内容帧 `meta_data` 为空 `{}`，帧内容是「增量 + 累积快照」混合推送（如 "测试"→"成功"→"测试成功"→"测试成功"）。网关用启发式解析：新帧以已累积内容为前缀且不短于它 → 快照替换（差分增量）；否则 → 追加。避免旧实现的文本翻倍问题。
+> - 真实账号端到端验证通过：刷新令牌 → 流式对话（思考链增量帧与网关解析器逐字段吻合），glm-5.3 与 glm-5.3-flash 均正常。
+> - **v1.0.9 全量逐行审查修复（2026-11-13）**：① 流结束时衔接 decoder 残余行——上游错误体常不带换行结尾，此前整体丢失，是「上游连接结束但未收到完成标记」的根因；② 工具定义附件上传失败时 Schema 退回正文内联（此前只带格式约定不带 Schema）；③ 字符串形态数字 status 同样提取错误消息；④ 快照收缩对齐已发送计数，防快照变短后后续文本被吞；⑤ 流拆分器持留 `</tool_call>` 分片前缀，防工具块被分片截断时泄漏为正文；⑥ Anthropic 流式内容块 index 唯一化（thinking/text/tool_use 不再复用索引互相覆盖）；⑦ Responses 允许无 user 消息的工具续跑请求；⑧ 面板配置先落盘再改内存。
 
 X-Sign 签名密钥是官方网页端 JS 中的公开协议指纹常量，已内置默认值，可在面板覆盖。
 
@@ -68,7 +74,7 @@ X-Sign 签名密钥是官方网页端 JS 中的公开协议指纹常量，已内
 | `upstream.max_context_chars` | 上下文文件最大字符数 | 200000 |
 | `upstream.delete_conversation` | 用完删除上游会话 | true |
 | `upstream.default_effort` | 默认思考强度 low/high/max（客户端未指定时） | high |
-| `upstream.effort_override` | 强制思考强度（非空时覆盖客户端请求） | 空 |
+| `upstream.effort_override` | 强制思考强度：非空时覆盖客户端请求的 reasoning_effort | 空（跟随客户端） |
 | `upstream.is_networking` | 上游联网开关 | true |
 | `model_aliases` | 客户端模型名 → 上游 selected_model | 空 |
 | `unknown_model_policy` | 未知模型映射策略 default / passthrough | default |
@@ -81,10 +87,12 @@ X-Sign 签名密钥是官方网页端 JS 中的公开协议指纹常量，已内
 
 ## 构建
 
-推送到 GitHub 后由 `.github/workflows/build.yml` 自动构建（nightly + Cranelift 后端，`opt-level=3` 即 Cranelift 的 Speed 档）：
+推送到 GitHub 后由 `.github/workflows/build.yml` 自动构建：
 
 - `agentmore2api-linux-x64.tar.gz`
 - `agentmore2api-windows-x64.zip`
+
+**构建后端：nightly + Cranelift**（`rustc-codegen-cranelift-preview` 组件 + `-Zcodegen-backend=cranelift`），`opt-level = 3` 对应 Cranelift 的 `OptLevel::Speed` 档。Cranelift 编译速度显著快于 LLVM，代价是运行时代码性能略低——对本网关这类 I/O 密集负载（TLS 加解密发生在原生加密库内）实际影响可忽略。注意 LTO 是 LLVM 专属优化，Cranelift 下必须保持关闭。
 
 提交信息带 `[release]` 标记或推送 `v*` 标签时会自动创建 GitHub Release，附件可直接公开下载（Actions 页面的 artifact 需要 GitHub 登录才能下载，Release 附件不需要）。
 
