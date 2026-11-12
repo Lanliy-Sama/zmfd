@@ -111,7 +111,7 @@ async fn pipeline_inner(
     let (token, slot, source) = state.tokens.get_access_token(state).await?;
     eprintln!("[zmfd] upstream slot={slot} source={source} model={selected_model} effort={effort}");
 
-    // 3. 上下文投递：优先上传附件；该槽位被上游拒绝过附件（游客）或配置为内联时直接内联。
+    // 3. 上下文投递：优先上传附件；该槽位被上游拒绝过附件或配置为内联时直接内联。
     let can_attach = state.tokens.slot_can_attach(slot).await;
     let mut uploaded: Option<UploadedFile> = None;
     if can_attach && cfg.upstream.context_send_mode != "inline" {
@@ -139,27 +139,35 @@ async fn pipeline_inner(
         &selected_model,
     );
 
-    // 4. 发起对话流；消息附件被上游拒绝（HTTP 400）时，标记槽位并以内联上下文重试一次。
-    let resp = match upstream::chat_stream(state, &token, body).await {
-        Ok(r) => r,
-        Err(e) => {
-            if uploaded.is_some() && e.status == 400 {
-                state.tokens.set_slot_attach(slot, false).await;
-                eprintln!(
-                    "[zmfd] 上游拒绝消息附件（HTTP 400），该槽位改用内联上下文重试: {}",
-                    e.message
-                );
-                instruction = inline_instruction.clone();
-                let retry_body = upstream::build_chat_body(
-                    &cfg.upstream,
-                    &instruction,
-                    None,
-                    &effort,
-                    &selected_model,
-                );
-                upstream::chat_stream(state, &token, retry_body).await?
-            } else {
-                return Err(e);
+    // 4. 发起对话流。上游对附件的拒绝有两种形态（都自动降级内联重试一次）：
+    //    a) HTTP 400（chat_stream 返回 Err）
+    //    b) HTTP 200 + 流内裸 JSON 业务错误帧（{"status":400,"message":"invalid param"}）
+    let mut used_file = uploaded.is_some();
+    let mut retried_in_stream = false;
+    let mut resp_slot: Option<reqwest::Response> = {
+        let first = upstream::chat_stream(state, &token, body).await;
+        match first {
+            Ok(r) => Some(r),
+            Err(e) => {
+                if used_file && e.status == 400 {
+                    state.tokens.set_slot_attach(slot, false).await;
+                    eprintln!(
+                        "[zmfd] 上游拒绝消息附件（HTTP 400），槽位改用内联上下文重试: {}",
+                        e.message
+                    );
+                    used_file = false;
+                    instruction = inline_instruction.clone();
+                    let retry_body = upstream::build_chat_body(
+                        &cfg.upstream,
+                        &instruction,
+                        None,
+                        &effort,
+                        &selected_model,
+                    );
+                    Some(upstream::chat_stream(state, &token, retry_body).await?)
+                } else {
+                    return Err(e);
+                }
             }
         }
     };
@@ -167,7 +175,7 @@ async fn pipeline_inner(
     let mut parser = UpstreamParser::new();
     let mut splitter = ToolStreamSplitter::new(canon.known_tool_names());
     let mut decoder = SseDecoder::new();
-    let mut stream = resp.bytes_stream();
+    let mut stream = resp_slot.take().unwrap().bytes_stream();
 
     let idle = Duration::from_secs(cfg.upstream.stream_idle_timeout_secs);
     let deadline = Instant::now() + Duration::from_secs(cfg.upstream.total_timeout_secs);
@@ -246,6 +254,32 @@ async fn pipeline_inner(
                         if ended {
                             if reason == "error" {
                                 if full_text.is_empty() && calls.is_empty() {
+                                    // 流内业务错误且尚未产出内容：若带附件则降级内联重试一次。
+                                    if used_file && !retried_in_stream {
+                                        retried_in_stream = true;
+                                        state.tokens.set_slot_attach(slot, false).await;
+                                        eprintln!(
+                                            "[zmfd] 流内业务错误拒绝附件（status={}），槽位改用内联上下文重试: {}",
+                                            ev.status, ev.error_text
+                                        );
+                                        used_file = false;
+                                        instruction = inline_instruction.clone();
+                                        let retry_body = upstream::build_chat_body(
+                                            &cfg.upstream,
+                                            &instruction,
+                                            None,
+                                            &effort,
+                                            &selected_model,
+                                        );
+                                        resp_slot = Some(
+                                            upstream::chat_stream(state, &token, retry_body).await?,
+                                        );
+                                        stream = resp_slot.take().unwrap().bytes_stream();
+                                        parser = UpstreamParser::new();
+                                        splitter = ToolStreamSplitter::new(canon.known_tool_names());
+                                        decoder = SseDecoder::new();
+                                        continue 'outer;
+                                    }
                                     let code = ev.error_code.unwrap_or(0);
                                     upstream_error = Some(GatewayError::upstream(format!(
                                         "上游返回错误（code={code}）: {}",
