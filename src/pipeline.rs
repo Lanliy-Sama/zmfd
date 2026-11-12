@@ -188,6 +188,8 @@ async fn pipeline_inner(
     let mut finish_reason = String::from("stop");
     let mut got_finish = false;
     let mut upstream_error: Option<GatewayError> = None;
+    // 流异常结束时的原始帧样本（前 3 行），随错误信息透出便于定位。
+    let mut raw_sample: Vec<String> = Vec::new();
 
     'outer: loop {
         if Instant::now() > deadline {
@@ -206,6 +208,10 @@ async fn pipeline_inner(
             }
             Ok(Some(Ok(bytes))) => {
                 for line in decoder.push(&bytes) {
+                    if raw_sample.len() < 3 {
+                        let t: String = line.chars().take(200).collect();
+                        raw_sample.push(t);
+                    }
                     if debug {
                         debug_line(&line);
                     }
@@ -353,7 +359,14 @@ async fn pipeline_inner(
         return Err(e);
     }
     if !got_finish {
-        return Err(GatewayError::upstream("上游连接结束但未收到完成标记"));
+        let raw = if raw_sample.is_empty() {
+            String::new()
+        } else {
+            format!("（上游响应前几行: {}）", raw_sample.join(" | "))
+        };
+        return Err(GatewayError::upstream(format!(
+            "上游连接结束但未收到完成标记{raw}"
+        )));
     }
 
     let finish = if !calls.is_empty() {
