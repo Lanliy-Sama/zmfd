@@ -450,22 +450,27 @@ impl UpstreamParser {
             }
         }
 
-        ev.status = obj
-            .get("status")
+        // 状态：字符串形态（finish/init/intervene/success…）或数字形态
+        // （如 -1001 积分不足、400 invalid param）。数字判定对两种形态都生效：
+        // 实测上游会用 HTTP 200 + 裸 JSON 帧承载业务错误，非 0/200 的数值状态都是错误帧。
+        let status_val = obj.get("status");
+        ev.status = status_val
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        if ev.status.is_empty() {
-            // status 可能是数字（如 -1001 积分不足、400 invalid param）：
-            // 实测上游会用 HTTP 200 + 裸 JSON 帧承载业务错误，非 0/200 的数值状态都是错误帧。
-            if let Some(n) = obj.get("status").and_then(Value::as_i64) {
+        let mut numeric_status = status_val.and_then(Value::as_i64);
+        if numeric_status.is_none() && !ev.status.is_empty() {
+            numeric_status = ev.status.parse::<i64>().ok();
+        }
+        if let Some(n) = numeric_status {
+            if ev.status.is_empty() {
                 ev.status = n.to_string();
-                if n != 0 && n != 200 {
-                    if let Some(t) = str_field(&obj, "message") {
-                        ev.error_text = t;
-                    }
-                    ev.error_code = Some(n);
+            }
+            if n != 0 && n != 200 {
+                if let Some(t) = str_field(&obj, "message") {
+                    ev.error_text = t;
                 }
+                ev.error_code = Some(n);
             }
         }
 
@@ -570,6 +575,8 @@ impl UpstreamParser {
         }
 
         // 差分出增量（按字符，与官方前端一致）。
+        // 快照收缩（模型重写/纠错使累积内容变短）时对齐已发送计数，
+        // 否则后续增长在追上旧计数之前会被整体吞掉。
         for id in &self.order {
             if let Some(full) = self.text.get(id) {
                 let total = full.chars().count();
@@ -578,6 +585,8 @@ impl UpstreamParser {
                     let delta: String = full.chars().skip(prev).collect();
                     self.sent_text.insert(id.clone(), total);
                     ev.text.push_str(&delta);
+                } else if total < prev {
+                    self.sent_text.insert(id.clone(), total);
                 }
             }
             if let Some(full) = self.reasoning.get(id) {
@@ -587,6 +596,8 @@ impl UpstreamParser {
                     let delta: String = full.chars().skip(prev).collect();
                     self.sent_reasoning.insert(id.clone(), total);
                     ev.reasoning.push_str(&delta);
+                } else if total < prev {
+                    self.sent_reasoning.insert(id.clone(), total);
                 }
             }
         }
