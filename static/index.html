@@ -92,7 +92,7 @@
       <h2>上游参数</h2>
       <label>上游基址</label>
       <input type="text" id="f_base_url" />
-      <label>assistant_id（网页 URL /chat/&lt;agent_id&gt;/&lt;conv&gt; 中的 agent_id）</label>
+      <label>assistant_id（对话模式默认助手，内置值已实测可用，一般无需修改）</label>
       <input type="text" id="f_assistant_id" />
       <div class="row">
         <div>
@@ -147,7 +147,7 @@
       <label>refresh_token 账号池（每行一个）</label>
       <textarea id="f_accounts" placeholder="浏览器登录 agentmore.chatglm.cn 后：DevTools → Application → Cookies → chatglm_refresh_token"></textarea>
       <div class="check"><input type="checkbox" id="f_guest_fallback" /><span>无账号时回退游客令牌</span></div>
-      <div class="hint">refresh_token 会自动轮换并写回配置文件；多账号自动轮转。</div>
+      <div class="hint">refresh_token 会自动轮换并写回配置文件；多账号自动轮转。注意：游客令牌没有对话积分，仅用于鉴权链路验证。</div>
     </div>
 
     <div class="card">
